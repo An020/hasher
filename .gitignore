@@ -4,3 +4,7 @@
 .projectmem/structure.json
 /target/
 .codegraph/
+.projectmem/
+CLAUDE.md
+plan.md
+AGENTS.md
