@@ -1,0 +1,29 @@
+{
+  "installFolderName": "hasher",
+  "binaries": [
+    "hashcheck.exe",
+    "hasher.exe"
+  ],
+  "shortcut": {
+    "name": "Hasher.lnk",
+    "targetBinary": "hasher.exe",
+    "description": "Hasher - Fast File Hash Verifier"
+  },
+  "registryShellBase": "Software\\Classes\\*\\shell",
+  "explorerVerbs": [
+    {
+      "keyName": "VerifyHashWithHasher",
+      "label": "Verify Hash with Hasher",
+      "commandBinary": "hashcheck.exe",
+      "iconBinary": "hasher.exe",
+      "arguments": "--interactive \"%1\""
+    },
+    {
+      "keyName": "GetHashWithHasher",
+      "label": "Get Hash with Hasher",
+      "commandBinary": "hashcheck.exe",
+      "iconBinary": "hasher.exe",
+      "arguments": "--get-hash \"%1\""
+    }
+  ]
+}
