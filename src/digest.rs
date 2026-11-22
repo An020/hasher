@@ -60,36 +60,6 @@ fn trim_quotes_and_ws(mut s: &str) -> &str {
     }
 }
 
-/// Parses a recognized algorithm label (case-insensitive, optional hyphens).
-fn parse_algo_name(label: &str) -> Option<HashAlgorithm> {
-    let normalized = label.trim();
-    if normalized.eq_ignore_ascii_case("crc32") || normalized.eq_ignore_ascii_case("crc-32") {
-        Some(HashAlgorithm::Crc32)
-    } else if normalized.eq_ignore_ascii_case("md5") || normalized.eq_ignore_ascii_case("md-5") {
-        Some(HashAlgorithm::Md5)
-    } else if normalized.eq_ignore_ascii_case("sha1") || normalized.eq_ignore_ascii_case("sha-1") {
-        Some(HashAlgorithm::Sha1)
-    } else if normalized.eq_ignore_ascii_case("sha256")
-        || normalized.eq_ignore_ascii_case("sha-256")
-    {
-        Some(HashAlgorithm::Sha256)
-    } else if normalized.eq_ignore_ascii_case("sha384")
-        || normalized.eq_ignore_ascii_case("sha-384")
-    {
-        Some(HashAlgorithm::Sha384)
-    } else if normalized.eq_ignore_ascii_case("sha512")
-        || normalized.eq_ignore_ascii_case("sha-512")
-    {
-        Some(HashAlgorithm::Sha512)
-    } else if normalized.eq_ignore_ascii_case("blake3")
-        || normalized.eq_ignore_ascii_case("blake-3")
-    {
-        Some(HashAlgorithm::Blake3)
-    } else {
-        None
-    }
-}
-
 /// Splits a `Key : Value` line such as PowerShell `Format-List` output.
 fn split_kv_colon(line: &str) -> Option<(&str, &str)> {
     let (key, value) = line.split_once(':')?;
@@ -158,7 +128,7 @@ fn parse_digest_entry(
         let left_trimmed = left.trim();
         if let Some((algo_part, rest)) = left_trimmed.split_once('(') {
             if let Some(filename_inner) = rest.strip_suffix(')') {
-                if let Some(algo) = parse_algo_name(algo_part) {
+                if let Some(algo) = HashAlgorithm::from_alias(algo_part) {
                     let parsed = finalize_digest(right, Some(algo), override_algo)?;
                     return Ok((clean_filename_token(filename_inner), parsed));
                 }
@@ -173,7 +143,7 @@ fn parse_digest_entry(
             return Ok((None, parsed));
         }
         // 3. Explicit colon prefix: `sha256:<hex>`, `blake3:<hex>`, etc.
-        if let Some(algo) = parse_algo_name(key) {
+        if let Some(algo) = HashAlgorithm::from_alias(key) {
             let (hex_part, name_part) = split_hex_and_filename(val);
             let parsed = finalize_digest(hex_part, Some(algo), override_algo)?;
             return Ok((name_part, parsed));
@@ -182,7 +152,7 @@ fn parse_digest_entry(
 
     // 4. Space-separated algorithm prefix (e.g. PowerShell table row `SHA256 <hex> [path]`)
     if let Some((first, rest)) = split_first_ws(s) {
-        if let Some(algo) = parse_algo_name(first) {
+        if let Some(algo) = HashAlgorithm::from_alias(first) {
             let (hex_part, name_part) = split_hex_and_filename(rest.trim_start());
             let parsed = finalize_digest(hex_part, Some(algo), override_algo)?;
             return Ok((name_part, parsed));
@@ -243,7 +213,7 @@ fn try_parse_powershell_block(
         }
         if let Some((k, v)) = split_kv_colon(line) {
             if k.eq_ignore_ascii_case("algorithm") {
-                detected_algo = parse_algo_name(v);
+                detected_algo = HashAlgorithm::from_alias(v);
             } else if k.eq_ignore_ascii_case("hash") {
                 hash_val = Some(v);
             }
@@ -354,7 +324,7 @@ fn extract_entries_from_text(
         if let Some((k, v)) = split_kv_colon(line) {
             if k.eq_ignore_ascii_case("algorithm") {
                 flush_ps(&mut ps_algo, &mut ps_hash, &mut ps_path, &mut entries);
-                ps_algo = parse_algo_name(v);
+                ps_algo = HashAlgorithm::from_alias(v);
                 continue;
             }
             if k.eq_ignore_ascii_case("hash") {
@@ -388,7 +358,7 @@ fn token_basename(token: &str) -> &str {
     token.rsplit(['/', '\\']).next().unwrap_or(token)
 }
 
-fn basenames_match(entry_name: &str, target_basename: &str) -> bool {
+pub(crate) fn basenames_match(entry_name: &str, target_basename: &str) -> bool {
     let entry_base = token_basename(entry_name);
     if cfg!(windows) {
         entry_base.to_lowercase() == target_basename.to_lowercase()
@@ -510,6 +480,38 @@ pub fn parse_checksum_manifest(
     Ok(entries)
 }
 
+/// Parses all valid `(Option<filepath>, ParsedDigest)` entries from multi-line text.
+///
+/// Accepts mixed algorithms per line (`SHA-256`, `MD5`, `CRC32`, `BLAKE3`, etc.), bare digest
+/// lines (`filepath == None`), `[hash] [filepath]` lines, OpenSSL tag lines, and PowerShell blocks.
+/// Blank lines and `#` comments are skipped.
+#[must_use]
+pub fn parse_digest_entries_from_str(
+    text: &str,
+    override_algo: Option<HashAlgorithm>,
+) -> Vec<(Option<String>, ParsedDigest)> {
+    extract_entries_from_text(text, override_algo)
+}
+
+/// Reads a checksum or multi-line `.txt` file (up to 1 MiB) and extracts all digest entries.
+///
+/// # Errors
+///
+/// Returns [`DigestError::FileTooLarge`] if the file exceeds 1 MiB,
+/// [`DigestError::NoDigestFound`] if no valid digest entries are present,
+/// or [`DigestError::Io`] on filesystem / UTF-8 decode failure.
+pub fn parse_digest_entries_from_file(
+    hash_file: &Path,
+    override_algo: Option<HashAlgorithm>,
+) -> Result<Vec<(Option<String>, ParsedDigest)>, DigestError> {
+    let text = read_capped_text(hash_file)?;
+    let entries = parse_digest_entries_from_str(&text, override_algo);
+    if entries.is_empty() {
+        return Err(DigestError::NoDigestFound);
+    }
+    Ok(entries)
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write as _;
@@ -518,8 +520,8 @@ mod tests {
     use tempfile::NamedTempFile;
 
     use super::{
-        DigestError, MAX_HASH_FILE_BYTES, parse_checksum_manifest, parse_digest_from_file,
-        parse_digest_str,
+        DigestError, MAX_HASH_FILE_BYTES, parse_checksum_manifest, parse_digest_entries_from_file,
+        parse_digest_entries_from_str, parse_digest_from_file, parse_digest_str,
     };
     use crate::algo::HashAlgorithm;
 
@@ -545,9 +547,11 @@ mod tests {
         assert_eq!(parsed_hyphen.algorithm, HashAlgorithm::Sha256);
         assert!(parsed_hyphen.explicit_algo);
 
-        let override_res =
-            parse_digest_str(&format!("sha256:{SHA256_EMPTY}"), Some(HashAlgorithm::Blake3))
-                .expect("override algo");
+        let override_res = parse_digest_str(
+            &format!("sha256:{SHA256_EMPTY}"),
+            Some(HashAlgorithm::Blake3),
+        )
+        .expect("override algo");
         assert_eq!(override_res.algorithm, HashAlgorithm::Blake3);
         assert!(!override_res.explicit_algo);
     }
@@ -563,19 +567,22 @@ mod tests {
         assert_eq!(md5.algorithm, HashAlgorithm::Md5);
         assert!(md5.explicit_algo);
 
-        let sha1 = parse_digest_str("sha-1:a9993e364706816aba3e25717850c26c9cd0d89d", None)
-            .expect("sha1");
+        let sha1 =
+            parse_digest_str("sha-1:a9993e364706816aba3e25717850c26c9cd0d89d", None).expect("sha1");
         assert_eq!(sha1.algorithm, HashAlgorithm::Sha1);
         assert!(sha1.explicit_algo);
 
-        let openssl =
-            parse_digest_str(&format!("SHA256 (ubuntu (amd64).iso) = {SHA256_EMPTY}"), None)
-                .expect("openssl");
+        let openssl = parse_digest_str(
+            &format!("SHA256 (ubuntu (amd64).iso) = {SHA256_EMPTY}"),
+            None,
+        )
+        .expect("openssl");
         assert_eq!(openssl.algorithm, HashAlgorithm::Sha256);
         assert_eq!(openssl.hex, SHA256_EMPTY);
         assert!(openssl.explicit_algo);
 
-        let gnu_text = parse_digest_str(&format!("{SHA256_ABC}  test file.bin"), None).expect("gnu");
+        let gnu_text =
+            parse_digest_str(&format!("{SHA256_ABC}  test file.bin"), None).expect("gnu");
         assert_eq!(gnu_text.hex, SHA256_ABC);
         assert!(!gnu_text.explicit_algo);
 
@@ -591,7 +598,8 @@ mod tests {
         assert_eq!(ps.hex, SHA256_ABC);
         assert!(ps.explicit_algo);
 
-        let ps_single = parse_digest_str(&format!("Hash : {SHA256_EMPTY}"), None).expect("ps single");
+        let ps_single =
+            parse_digest_str(&format!("Hash : {SHA256_EMPTY}"), None).expect("ps single");
         assert_eq!(ps_single.hex, SHA256_EMPTY);
     }
 
@@ -636,9 +644,8 @@ mod tests {
         .expect("basename match");
         assert_eq!(matched.hex, SHA256_ABC);
 
-        let ambiguous =
-            parse_digest_from_file(tmp.path(), Some(Path::new("other.zip")), None)
-                .expect_err("multiple unmatched should error");
+        let ambiguous = parse_digest_from_file(tmp.path(), Some(Path::new("other.zip")), None)
+            .expect_err("multiple unmatched should error");
         assert!(matches!(ambiguous, DigestError::AmbiguousHashFile));
     }
 
@@ -649,12 +656,9 @@ mod tests {
         writeln!(single, "{SHA256_ABC}  original-name.zip").expect("write");
         single.flush().expect("flush");
 
-        let fallback = parse_digest_from_file(
-            single.path(),
-            Some(Path::new("renamed-download.zip")),
-            None,
-        )
-        .expect("single digest fallback");
+        let fallback =
+            parse_digest_from_file(single.path(), Some(Path::new("renamed-download.zip")), None)
+                .expect("single digest fallback");
         assert_eq!(fallback.hex, SHA256_ABC);
 
         let mut empty = NamedTempFile::new().expect("temp file");
@@ -694,5 +698,56 @@ mod tests {
         assert_eq!(entries[1].0, PathBuf::from("abc.txt"));
         assert_eq!(entries[2].0, PathBuf::from("data.bin"));
         assert_eq!(entries[2].1.algorithm, HashAlgorithm::Blake3);
+    }
+
+    #[test]
+    fn parse_digest_entries_handles_mixed_algorithms_paths_and_bare_lines() {
+        let md5_hex = "d41d8cd98f00b204e9800998ecf8427e";
+        let crc_hex = "cbf43926";
+        let sample = format!(
+            "# Mixed checksums\n\n{SHA256_EMPTY} ./prog1.exe\n{md5_hex} ./prog2.exe\nblake3:{SHA256_ABC} ./prog3.exe\n{crc_hex}\n{SHA256_ABC}\n"
+        );
+        let entries = parse_digest_entries_from_str(&sample, None);
+        assert_eq!(entries.len(), 5);
+        assert_eq!(entries[0].0.as_deref(), Some("./prog1.exe"));
+        assert_eq!(entries[0].1.algorithm, HashAlgorithm::Sha256);
+        assert_eq!(entries[1].0.as_deref(), Some("./prog2.exe"));
+        assert_eq!(entries[1].1.algorithm, HashAlgorithm::Md5);
+        assert_eq!(entries[2].0.as_deref(), Some("./prog3.exe"));
+        assert_eq!(entries[2].1.algorithm, HashAlgorithm::Blake3);
+        assert!(entries[2].1.explicit_algo);
+        assert_eq!(entries[3].0, None);
+        assert_eq!(entries[3].1.algorithm, HashAlgorithm::Crc32);
+        assert_eq!(entries[4].0, None);
+        assert_eq!(entries[4].1.algorithm, HashAlgorithm::Sha256);
+    }
+
+    #[test]
+    fn parse_digest_entries_from_file_enforces_empty_and_size_guards() {
+        let mut valid = NamedTempFile::new().expect("temp file");
+        writeln!(valid, "{SHA256_EMPTY} ./prog1.exe").expect("write");
+        writeln!(valid, "900150983cd24fb0d6963f7d28e17f72 ./prog2.exe").expect("write");
+        valid.flush().expect("flush");
+        let parsed = parse_digest_entries_from_file(valid.path(), None).expect("mixed entries");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].1.algorithm, HashAlgorithm::Sha256);
+        assert_eq!(parsed[1].1.algorithm, HashAlgorithm::Md5);
+
+        let mut empty = NamedTempFile::new().expect("temp file");
+        writeln!(empty, "# comments only\nNot a hash line").expect("write");
+        empty.flush().expect("flush");
+        assert!(matches!(
+            parse_digest_entries_from_file(empty.path(), None),
+            Err(DigestError::NoDigestFound)
+        ));
+
+        let mut large = NamedTempFile::new().expect("temp file");
+        let oversized = vec![b'a'; usize::try_from(MAX_HASH_FILE_BYTES).expect("usize") + 1];
+        large.write_all(&oversized).expect("write");
+        large.flush().expect("flush");
+        assert!(matches!(
+            parse_digest_entries_from_file(large.path(), None),
+            Err(DigestError::FileTooLarge(_))
+        ));
     }
 }

@@ -1,31 +1,40 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+use std::collections::{HashSet, VecDeque};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arboard::Clipboard;
 use eframe::egui::{
-    self, Align2, Color32, ComboBox, CornerRadius, FontFamily, FontId, Frame, Id, Key, Label,
-    LayerId, Margin, Order, ProgressBar, RichText, ScrollArea, Stroke, StrokeKind, TextEdit, Vec2,
-    ViewportBuilder,
+    self, Align, Align2, CollapsingHeader, Color32, ComboBox, CornerRadius, FontFamily, FontId,
+    Frame, Id, Key, Label, LayerId, Layout, Margin, Order, ProgressBar, RichText, ScrollArea,
+    Stroke, StrokeKind, TextEdit, TopBottomPanel, Vec2, ViewportBuilder,
 };
 use hasher::algo::HashAlgorithm;
-use hasher::digest::{ParsedDigest, parse_digest_from_file, parse_digest_str};
+use hasher::batch::{
+    BatchTargetRef, bounded_parallel_workers, canonical_path_key, hash_file_dialog_extensions,
+    is_dedicated_checksum_extension, is_text_or_checksum_extension, natural_cmp,
+    plan_manifest_assignments, scan_folder_for_batch, should_warn_large_parallel_batch,
+};
+use hasher::digest::{
+    MAX_HASH_FILE_BYTES, ParsedDigest, parse_digest_entries_from_file,
+    parse_digest_entries_from_str, parse_digest_from_file, parse_digest_str,
+};
 use hasher::verify::{VerifyReport, compute_only, verify_target};
 use rfd::FileDialog;
 
-const MAX_HASH_FILE_BYTES: u64 = 1024 * 1024;
 const BYTES_PER_MIB: f64 = 1024.0 * 1024.0;
 
 fn main() -> eframe::Result {
     let native_options = eframe::NativeOptions {
         viewport: ViewportBuilder::default()
             .with_title("Hasher - File Hash Verifier")
-            .with_inner_size([680.0, 540.0])
-            .with_min_inner_size([520.0, 420.0]),
+            .with_inner_size([880.0, 620.0])
+            .with_min_inner_size([640.0, 440.0]),
         ..Default::default()
     };
 
@@ -37,6 +46,12 @@ fn main() -> eframe::Result {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveTab {
+    SingleFile,
+    BatchCheck,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AlgorithmChoice {
     Auto,
     Specific(HashAlgorithm),
@@ -44,8 +59,12 @@ enum AlgorithmChoice {
 
 impl AlgorithmChoice {
     fn dropdown_options() -> impl Iterator<Item = Self> {
-        std::iter::once(Self::Auto)
-            .chain(HashAlgorithm::picker_order().iter().copied().map(Self::Specific))
+        std::iter::once(Self::Auto).chain(
+            HashAlgorithm::picker_order()
+                .iter()
+                .copied()
+                .map(Self::Specific),
+        )
     }
 
     fn label(self) -> &'static str {
@@ -88,7 +107,81 @@ enum AppOutcome {
     Error(String),
 }
 
+enum BatchRowState {
+    Idle,
+    Queued,
+    Running {
+        bytes_read: Arc<AtomicU64>,
+        total_bytes: u64,
+        started_at: Instant,
+    },
+    Finished(VerifyReport),
+    Cancelled,
+    Error(String),
+}
+
+struct BatchRow {
+    id: u64,
+    path: PathBuf,
+    canonical_key: PathBuf,
+    relative_label: String,
+    size_bytes: u64,
+    expected_input: String,
+    algo_choice: AlgorithmChoice,
+    state: BatchRowState,
+}
+
+struct BatchTask {
+    row_id: u64,
+    path: PathBuf,
+    expected: ParsedDigest,
+    total_bytes: u64,
+}
+
+enum BatchWorkerMsg {
+    Started {
+        row_id: u64,
+        bytes_read: Arc<AtomicU64>,
+        total_bytes: u64,
+        started_at: Instant,
+    },
+    Finished {
+        row_id: u64,
+        result: Result<VerifyReport, String>,
+    },
+    AllDone,
+}
+
+struct BatchRun {
+    cancel_flag: Arc<AtomicBool>,
+    receiver: Receiver<BatchWorkerMsg>,
+}
+
+enum PendingBatchConfirm {
+    MissingHashes {
+        missing_count: usize,
+        filled_count: usize,
+    },
+    LargeParallelBatch {
+        file_count: usize,
+        total_bytes: u64,
+    },
+}
+
+#[derive(Default)]
+struct BatchState {
+    folder_input: String,
+    include_subfolders: bool,
+    rows: Vec<BatchRow>,
+    next_row_id: u64,
+    running: Option<BatchRun>,
+    pending_confirm: Option<PendingBatchConfirm>,
+    info_message: Option<String>,
+    error_message: Option<String>,
+}
+
 struct HasherApp {
+    active_tab: ActiveTab,
     file_path: String,
     expected_input: String,
     algo_choice: AlgorithmChoice,
@@ -97,6 +190,7 @@ struct HasherApp {
     info_message: Option<String>,
     copied_until: Option<Instant>,
     cached_target_size: (String, Option<u64>),
+    batch: BatchState,
 }
 
 impl HasherApp {
@@ -111,18 +205,15 @@ impl HasherApp {
     where
         I: IntoIterator<Item = String>,
     {
-        let mut iter = args.into_iter().take(2);
-        let first_raw = iter.next().map(|arg| strip_surrounding_quotes(&arg));
-        let second_raw = iter.next().map(|arg| strip_surrounding_quotes(&arg));
-
-        let (file_arg, hash_arg) = match (first_raw, second_raw) {
-            (Some(first), Some(second)) => resolve_startup_pair(first, second),
-            (Some(first), None) => (first, String::new()),
-            (None, _) => (String::new(), String::new()),
-        };
+        let raw_args: Vec<String> = args
+            .into_iter()
+            .map(|arg| strip_surrounding_quotes(&arg))
+            .filter(|arg| !arg.is_empty())
+            .collect();
 
         let mut app = Self {
-            file_path: file_arg,
+            active_tab: ActiveTab::SingleFile,
+            file_path: String::new(),
             expected_input: String::new(),
             algo_choice: AlgorithmChoice::Auto,
             running: None,
@@ -130,7 +221,32 @@ impl HasherApp {
             info_message: None,
             copied_until: None,
             cached_target_size: (String::new(), None),
+            batch: BatchState::default(),
         };
+
+        let paths: Vec<PathBuf> = raw_args.iter().map(PathBuf::from).collect();
+        let has_dir = paths.iter().any(|p| p.is_dir());
+        let non_checksum_count = paths
+            .iter()
+            .filter(|p| p.is_file() && !is_text_or_checksum_extension(p))
+            .count();
+        if has_dir || non_checksum_count >= 2 || raw_args.len() > 2 {
+            app.active_tab = ActiveTab::BatchCheck;
+            app.import_batch_selection(&paths);
+            return app;
+        }
+
+        let mut iter = raw_args.into_iter().take(2);
+        let first_raw = iter.next();
+        let second_raw = iter.next();
+
+        let (file_arg, hash_arg) = match (first_raw, second_raw) {
+            (Some(first), Some(second)) => resolve_startup_pair(first, second),
+            (Some(first), None) => (first, String::new()),
+            (None, _) => (String::new(), String::new()),
+        };
+
+        app.file_path = file_arg;
         app.refresh_target_size();
 
         if !hash_arg.is_empty() {
@@ -202,33 +318,26 @@ impl HasherApp {
     }
 
     fn paste_expected_from_clipboard(&mut self) {
-        match Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
-            Ok(text) => {
-                let trimmed = text.trim();
-                let parsed_multiline = (trimmed.contains('\n') || trimmed.contains('\r'))
-                    .then(|| parse_digest_str(trimmed, self.algo_choice.to_override()))
-                    .and_then(Result::ok);
-                if let Some(parsed) = parsed_multiline {
-                    self.expected_input = parsed.hex;
-                    if parsed.explicit_algo && self.algo_choice == AlgorithmChoice::Auto {
-                        self.algo_choice = AlgorithmChoice::Specific(parsed.algorithm);
-                    }
-                    self.outcome = None;
-                    let algo_name = parsed.algorithm.as_str();
-                    self.info_message = Some(format!("Pasted {algo_name} hash from clipboard."));
-                    return;
+        match read_clipboard_digest_or_raw(self.algo_choice.to_override()) {
+            Ok((text, explicit_algo)) => {
+                self.expected_input = text;
+                if let Some(algo) = explicit_algo
+                    && self.algo_choice == AlgorithmChoice::Auto
+                {
+                    self.algo_choice = AlgorithmChoice::Specific(algo);
                 }
-                trimmed.clone_into(&mut self.expected_input);
                 self.outcome = None;
                 self.info_message = if self.expected_input.is_empty() {
                     Some("Clipboard text is empty.".to_owned())
+                } else if let Some(algo) = explicit_algo {
+                    Some(format!("Pasted {} hash from clipboard.", algo.as_str()))
                 } else {
                     Some("Pasted hash from clipboard.".to_owned())
                 };
             }
             Err(err) => {
                 self.info_message = None;
-                self.outcome = Some(AppOutcome::Error(format!("Clipboard read failed: {err}")));
+                self.outcome = Some(AppOutcome::Error(err));
             }
         }
     }
@@ -240,11 +349,9 @@ impl HasherApp {
     }
 
     fn pick_hash_file(&mut self) {
+        let exts = hash_file_dialog_extensions();
         let picked = FileDialog::new()
-            .add_filter(
-                "Checksum / Text Files",
-                &["txt", "sha256", "sha512", "sha384", "sha1", "md5", "sum"],
-            )
+            .add_filter("Checksum / Text Files", &exts)
             .add_filter("All Files", &["*"])
             .pick_file();
 
@@ -373,14 +480,34 @@ impl HasherApp {
             return;
         }
 
-        if self.running.is_some() {
-            self.info_message =
-                Some("Cancel the current operation before dropping a new file.".to_owned());
+        if self.running.is_some() || self.batch.running.is_some() {
+            let msg = "Cancel the current operation before dropping new files.".to_owned();
+            if self.active_tab == ActiveTab::BatchCheck {
+                self.batch.info_message = Some(msg);
+            } else {
+                self.info_message = Some(msg);
+            }
             return;
         }
 
         let paths: Vec<PathBuf> = dropped.into_iter().filter_map(|file| file.path).collect();
         if paths.is_empty() {
+            return;
+        }
+
+        let has_dir = paths.iter().any(|p| p.is_dir());
+        let non_checksum_count = paths
+            .iter()
+            .filter(|p| p.is_file() && !is_text_or_checksum_extension(p))
+            .count();
+
+        if self.active_tab == ActiveTab::BatchCheck
+            || has_dir
+            || non_checksum_count >= 2
+            || paths.len() > 2
+        {
+            self.active_tab = ActiveTab::BatchCheck;
+            self.import_batch_selection(&paths);
             return;
         }
 
@@ -418,11 +545,580 @@ impl HasherApp {
         match Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text.to_owned())) {
             Ok(()) => {
                 self.copied_until = Some(Instant::now() + Duration::from_secs(2));
-                self.info_message = Some("Copied hash to clipboard.".to_owned());
+                let msg = "Copied hash to clipboard.".to_owned();
+                if self.active_tab == ActiveTab::BatchCheck {
+                    self.batch.info_message = Some(msg);
+                } else {
+                    self.info_message = Some(msg);
+                }
             }
             Err(err) => {
-                self.info_message = Some(format!("Clipboard copy failed: {err}"));
+                let msg = format!("Clipboard copy failed: {err}");
+                if self.active_tab == ActiveTab::BatchCheck {
+                    self.batch.error_message = Some(msg);
+                } else {
+                    self.info_message = Some(msg);
+                }
             }
+        }
+    }
+
+    fn import_batch_paths(&mut self, paths: &[PathBuf], base_dir: Option<&Path>) -> (usize, usize) {
+        let mut seen: HashSet<PathBuf> = self
+            .batch
+            .rows
+            .iter()
+            .map(|row| row.canonical_key.clone())
+            .collect();
+        let mut added = 0usize;
+        let mut skipped_dups = 0usize;
+
+        for path in paths {
+            let Ok(meta) = std::fs::metadata(path) else {
+                continue;
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            let key = canonical_path_key(path);
+            if !seen.insert(key.clone()) {
+                skipped_dups += 1;
+                continue;
+            }
+
+            let relative_label = base_dir
+                .and_then(|root| path.strip_prefix(root).ok())
+                .map_or_else(
+                    || {
+                        path.file_name().map_or_else(
+                            || path.display().to_string(),
+                            |name| name.to_string_lossy().into_owned(),
+                        )
+                    },
+                    |rel| rel.to_string_lossy().into_owned(),
+                );
+
+            self.batch.next_row_id += 1;
+            self.batch.rows.push(BatchRow {
+                id: self.batch.next_row_id,
+                path: path.clone(),
+                canonical_key: key,
+                relative_label,
+                size_bytes: meta.len(),
+                expected_input: String::new(),
+                algo_choice: AlgorithmChoice::Auto,
+                state: BatchRowState::Idle,
+            });
+            added += 1;
+        }
+
+        (added, skipped_dups)
+    }
+
+    fn import_batch_folder(&mut self, dir: &Path) {
+        self.batch.pending_confirm = None;
+        self.batch.error_message = None;
+        self.batch.folder_input = dir.display().to_string();
+
+        match scan_folder_for_batch(dir, self.batch.include_subfolders) {
+            Ok(scan) => {
+                let (added, dups) = self.import_batch_paths(&scan.target_files, Some(dir));
+                let mut note = format!("Added {added} file(s) from {}", dir.display());
+                if dups > 0 {
+                    let _ = write!(note, " ({dups} already listed)");
+                }
+                note.push('.');
+
+                if scan.checksum_files.len() == 1 {
+                    let cs_path = &scan.checksum_files[0];
+                    if let Ok(entries) = parse_digest_entries_from_file(cs_path, None) {
+                        let label = cs_path.file_name().map_or_else(
+                            || cs_path.display().to_string(),
+                            |n| n.to_string_lossy().into_owned(),
+                        );
+                        let summary = self.apply_batch_entries(&entries, &label);
+                        self.batch.info_message = Some(format!("{note} {summary}"));
+                        return;
+                    }
+                } else if scan.checksum_files.len() > 1 {
+                    let _ = write!(
+                        note,
+                        " Found {} .txt/checksum files; click Load .txt... to choose one.",
+                        scan.checksum_files.len()
+                    );
+                }
+
+                self.batch.info_message = Some(note);
+            }
+            Err(err) => {
+                self.batch.error_message = Some(format!("Failed to scan folder: {err}"));
+            }
+        }
+    }
+
+    fn import_batch_selection(&mut self, paths: &[PathBuf]) {
+        self.batch.pending_confirm = None;
+        self.batch.error_message = None;
+
+        let mut dirs = Vec::new();
+        let mut target_files = Vec::new();
+        let mut checksum_files = Vec::new();
+
+        for path in paths {
+            if path.is_dir() {
+                dirs.push(path.clone());
+            } else if path.is_file() {
+                if is_text_or_checksum_extension(path) {
+                    checksum_files.push(path.clone());
+                } else {
+                    target_files.push(path.clone());
+                }
+            }
+        }
+
+        target_files.sort_by(|a, b| {
+            let na = a.file_name().unwrap_or_default().to_string_lossy();
+            let nb = b.file_name().unwrap_or_default().to_string_lossy();
+            natural_cmp(&na, &nb)
+        });
+
+        let mut messages = Vec::new();
+        for dir in dirs {
+            self.import_batch_folder(&dir);
+            if let Some(msg) = self.batch.info_message.take() {
+                messages.push(msg);
+            }
+        }
+
+        if !target_files.is_empty() {
+            let (added, dups) = self.import_batch_paths(&target_files, None);
+            let mut msg = format!("Added {added} file(s).");
+            if dups > 0 {
+                msg = format!("Added {added} file(s) ({dups} already listed).");
+            }
+            messages.push(msg);
+        }
+
+        for cs_path in checksum_files {
+            self.load_batch_hashes_from_file(&cs_path);
+            if let Some(msg) = self.batch.info_message.take() {
+                messages.push(msg);
+            }
+        }
+
+        if !messages.is_empty() {
+            self.batch.info_message = Some(messages.join(" "));
+        }
+    }
+
+    fn apply_batch_entries(
+        &mut self,
+        entries: &[(Option<String>, ParsedDigest)],
+        source_label: &str,
+    ) -> String {
+        self.batch.pending_confirm = None;
+        if self.batch.rows.is_empty() {
+            let msg = format!(
+                "Loaded {} hash entry(s) from {source_label}, but no target files are imported yet.",
+                entries.len()
+            );
+            self.batch.error_message = Some(msg.clone());
+            return msg;
+        }
+
+        let plan = {
+            let targets: Vec<BatchTargetRef<'_>> = self
+                .batch
+                .rows
+                .iter()
+                .map(|row| BatchTargetRef {
+                    path: &row.path,
+                    relative_label: &row.relative_label,
+                })
+                .collect();
+            plan_manifest_assignments(&targets, entries)
+        };
+
+        for (idx, parsed) in &plan.assignments {
+            if let Some(row) = self.batch.rows.get_mut(*idx) {
+                row.expected_input.clone_from(&parsed.hex);
+                row.algo_choice = if parsed.explicit_algo {
+                    AlgorithmChoice::Specific(parsed.algorithm)
+                } else {
+                    AlgorithmChoice::Auto
+                };
+                row.state = BatchRowState::Idle;
+            }
+        }
+
+        let filled_total = self
+            .batch
+            .rows
+            .iter()
+            .filter(|r| !r.expected_input.trim().is_empty())
+            .count();
+        let remaining_blank = self.batch.rows.len().saturating_sub(filled_total);
+
+        let mut summary = format!(
+            "Auto-filled {} hash(es) from {source_label} ({} matched by path, {} positional).",
+            plan.assignments.len(),
+            plan.matched_by_path,
+            plan.matched_positionally
+        );
+        if plan.unmatched_entries > 0 {
+            let _ = write!(
+                summary,
+                " {} extra/unmatched entry(s) ignored.",
+                plan.unmatched_entries
+            );
+        }
+        if remaining_blank > 0 {
+            let _ = write!(summary, " {remaining_blank} row(s) still need hashes.");
+        }
+
+        self.batch.error_message = None;
+        self.batch.info_message = Some(summary.clone());
+        summary
+    }
+
+    fn load_batch_hashes_from_file(&mut self, path: &Path) {
+        let label = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        match parse_digest_entries_from_file(path, None) {
+            Ok(entries) => {
+                self.apply_batch_entries(&entries, &label);
+            }
+            Err(err) => {
+                self.batch.error_message =
+                    Some(format!("Could not load hashes from {label}: {err}"));
+            }
+        }
+    }
+
+    fn paste_batch_hash_list(&mut self) {
+        self.batch.pending_confirm = None;
+        match Clipboard::new().and_then(|mut cb| cb.get_text()) {
+            Ok(text) => {
+                let entries = parse_digest_entries_from_str(&text, None);
+                if entries.is_empty() {
+                    self.batch.error_message =
+                        Some("Clipboard does not contain any valid hash lines.".to_owned());
+                } else {
+                    self.apply_batch_entries(&entries, "clipboard");
+                }
+            }
+            Err(err) => {
+                self.batch.error_message = Some(format!("Clipboard read failed: {err}"));
+            }
+        }
+    }
+
+    fn paste_into_batch_row(&mut self, row_id: u64) {
+        let Some(row) = self.batch.rows.iter_mut().find(|r| r.id == row_id) else {
+            return;
+        };
+        match read_clipboard_digest_or_raw(row.algo_choice.to_override()) {
+            Ok((text, explicit_algo)) => {
+                if text.is_empty() {
+                    self.batch.info_message = Some("Clipboard text is empty.".to_owned());
+                    return;
+                }
+                row.expected_input = text;
+                if let Some(algo) = explicit_algo
+                    && row.algo_choice == AlgorithmChoice::Auto
+                {
+                    row.algo_choice = AlgorithmChoice::Specific(algo);
+                }
+                row.state = BatchRowState::Idle;
+                self.batch.pending_confirm = None;
+                self.batch.error_message = None;
+            }
+            Err(err) => {
+                self.batch.error_message = Some(err);
+            }
+        }
+    }
+
+    fn pick_batch_folder(&mut self) {
+        if let Some(dir) = FileDialog::new().pick_folder() {
+            self.import_batch_folder(&dir);
+        }
+    }
+
+    fn pick_batch_files(&mut self) {
+        if let Some(paths) = FileDialog::new().pick_files() {
+            self.import_batch_selection(&paths);
+        }
+    }
+
+    fn pick_batch_hash_file(&mut self) {
+        let exts = hash_file_dialog_extensions();
+        if let Some(path) = FileDialog::new()
+            .add_filter("Checksum / Text Files", &exts)
+            .add_filter("All Files", &["*"])
+            .pick_file()
+        {
+            self.load_batch_hashes_from_file(&path);
+        }
+    }
+
+    fn start_single_batch_row(&mut self, row_id: u64, ctx: &egui::Context) {
+        if self.batch.running.is_some() {
+            return;
+        }
+        self.batch.pending_confirm = None;
+        self.batch.error_message = None;
+
+        let Some(row) = self.batch.rows.iter_mut().find(|r| r.id == row_id) else {
+            return;
+        };
+        let trimmed = row.expected_input.trim();
+        if trimmed.is_empty() {
+            row.state = BatchRowState::Error("Enter an expected hash first.".to_owned());
+            return;
+        }
+        let parsed = match parse_digest_str(trimmed, row.algo_choice.to_override()) {
+            Ok(p) => p,
+            Err(err) => {
+                row.state = BatchRowState::Error(format!("Invalid expected hash: {err}"));
+                return;
+            }
+        };
+        let total_bytes = match std::fs::metadata(&row.path) {
+            Ok(meta) if meta.is_file() => {
+                row.size_bytes = meta.len();
+                meta.len()
+            }
+            Ok(_) => {
+                row.state = BatchRowState::Error("Target path is not a regular file.".to_owned());
+                return;
+            }
+            Err(err) => {
+                row.state = BatchRowState::Error(format!("Cannot access file: {err}"));
+                return;
+            }
+        };
+
+        row.state = BatchRowState::Queued;
+        let task = BatchTask {
+            row_id: row.id,
+            path: row.path.clone(),
+            expected: parsed,
+            total_bytes,
+        };
+        self.launch_batch_tasks(vec![task], 1, ctx);
+    }
+
+    fn request_check_all(&mut self, ctx: &egui::Context) {
+        if self.batch.running.is_some() || self.batch.rows.is_empty() {
+            return;
+        }
+        self.batch.error_message = None;
+        self.batch.pending_confirm = None;
+
+        let filled_count = self
+            .batch
+            .rows
+            .iter()
+            .filter(|r| !r.expected_input.trim().is_empty())
+            .count();
+        if filled_count == 0 {
+            self.batch.error_message = Some(
+                "Enter or load at least one expected hash before running Check All.".to_owned(),
+            );
+            return;
+        }
+
+        let missing_count = self.batch.rows.len().saturating_sub(filled_count);
+        if missing_count > 0 {
+            self.batch.pending_confirm = Some(PendingBatchConfirm::MissingHashes {
+                missing_count,
+                filled_count,
+            });
+            return;
+        }
+
+        self.proceed_check_all_after_missing_check(ctx);
+    }
+
+    fn proceed_check_all_after_missing_check(&mut self, ctx: &egui::Context) {
+        self.batch.pending_confirm = None;
+        let (file_count, total_bytes) = self
+            .batch
+            .rows
+            .iter()
+            .filter(|r| !r.expected_input.trim().is_empty())
+            .fold((0usize, 0u64), |(cnt, sum), r| {
+                let bytes = std::fs::metadata(&r.path).map_or(r.size_bytes, |m| m.len());
+                (cnt + 1, sum.saturating_add(bytes))
+            });
+
+        if should_warn_large_parallel_batch(file_count, total_bytes) {
+            self.batch.pending_confirm = Some(PendingBatchConfirm::LargeParallelBatch {
+                file_count,
+                total_bytes,
+            });
+            return;
+        }
+
+        let workers = bounded_parallel_workers(total_bytes);
+        self.execute_check_all(workers, ctx);
+    }
+
+    fn execute_check_all(&mut self, max_workers: usize, ctx: &egui::Context) {
+        self.batch.pending_confirm = None;
+        self.batch.error_message = None;
+        let mut tasks = Vec::new();
+
+        for row in &mut self.batch.rows {
+            let trimmed = row.expected_input.trim();
+            if trimmed.is_empty() {
+                if !matches!(row.state, BatchRowState::Finished(_)) {
+                    row.state = BatchRowState::Idle;
+                }
+                continue;
+            }
+
+            let parsed = match parse_digest_str(trimmed, row.algo_choice.to_override()) {
+                Ok(p) => p,
+                Err(err) => {
+                    row.state = BatchRowState::Error(format!("Invalid expected hash: {err}"));
+                    continue;
+                }
+            };
+
+            let total_bytes = match std::fs::metadata(&row.path) {
+                Ok(meta) if meta.is_file() => {
+                    row.size_bytes = meta.len();
+                    meta.len()
+                }
+                Ok(_) => {
+                    row.state = BatchRowState::Error("Path is not a regular file.".to_owned());
+                    continue;
+                }
+                Err(err) => {
+                    row.state = BatchRowState::Error(format!("Cannot access file: {err}"));
+                    continue;
+                }
+            };
+
+            row.state = BatchRowState::Queued;
+            tasks.push(BatchTask {
+                row_id: row.id,
+                path: row.path.clone(),
+                expected: parsed,
+                total_bytes,
+            });
+        }
+
+        if tasks.is_empty() {
+            if self.batch.error_message.is_none() {
+                self.batch.error_message = Some("No valid rows are ready to verify.".to_owned());
+            }
+            return;
+        }
+
+        self.launch_batch_tasks(tasks, max_workers, ctx);
+    }
+
+    fn launch_batch_tasks(
+        &mut self,
+        tasks: Vec<BatchTask>,
+        max_workers: usize,
+        ctx: &egui::Context,
+    ) {
+        let task_count = tasks.len();
+        let worker_count = max_workers.min(task_count).max(1);
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = mpsc::channel::<BatchWorkerMsg>();
+        let queue = Arc::new(Mutex::new(VecDeque::from(tasks)));
+
+        let worker_ctx = ctx.clone();
+        let batch_cancel = Arc::clone(&cancel_flag);
+
+        std::thread::spawn(move || {
+            std::thread::scope(|scope| {
+                for _ in 0..worker_count {
+                    let q = Arc::clone(&queue);
+                    let tx = sender.clone();
+                    let cancel = Arc::clone(&batch_cancel);
+                    let repaint_ctx = worker_ctx.clone();
+                    scope.spawn(move || {
+                        run_batch_worker_loop(&q, &tx, &cancel, &repaint_ctx);
+                    });
+                }
+            });
+            let _ = sender.send(BatchWorkerMsg::AllDone);
+            worker_ctx.request_repaint();
+        });
+
+        self.batch.running = Some(BatchRun {
+            cancel_flag,
+            receiver,
+        });
+    }
+
+    fn poll_batch_worker(&mut self, ctx: &egui::Context) {
+        let mut finished = false;
+        let was_cancelled = self
+            .batch
+            .running
+            .as_ref()
+            .is_some_and(|run| run.cancel_flag.load(Ordering::Relaxed));
+
+        if let Some(ref run) = self.batch.running {
+            loop {
+                match run.receiver.try_recv() {
+                    Ok(BatchWorkerMsg::Started {
+                        row_id,
+                        bytes_read,
+                        total_bytes,
+                        started_at,
+                    }) => {
+                        if let Some(row) = self.batch.rows.iter_mut().find(|r| r.id == row_id) {
+                            row.state = BatchRowState::Running {
+                                bytes_read,
+                                total_bytes,
+                                started_at,
+                            };
+                        }
+                    }
+                    Ok(BatchWorkerMsg::Finished { row_id, result }) => {
+                        if let Some(row) = self.batch.rows.iter_mut().find(|r| r.id == row_id) {
+                            row.state = match result {
+                                Ok(report) => BatchRowState::Finished(report),
+                                Err(_) if was_cancelled => BatchRowState::Cancelled,
+                                Err(err) => BatchRowState::Error(err),
+                            };
+                        }
+                    }
+                    Ok(BatchWorkerMsg::AllDone) | Err(TryRecvError::Disconnected) => {
+                        finished = true;
+                        break;
+                    }
+                    Err(TryRecvError::Empty) => break,
+                }
+            }
+        }
+
+        if finished {
+            self.batch.running = None;
+            for row in &mut self.batch.rows {
+                if matches!(
+                    row.state,
+                    BatchRowState::Queued | BatchRowState::Running { .. }
+                ) {
+                    row.state = if was_cancelled {
+                        BatchRowState::Cancelled
+                    } else {
+                        BatchRowState::Idle
+                    };
+                }
+            }
+        } else if self.batch.running.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(50));
         }
     }
 
@@ -512,7 +1208,10 @@ impl HasherApp {
         }
 
         ui.horizontal(|ui| {
-            if ui.add_enabled(!running, egui::Button::new("Paste")).clicked() {
+            if ui
+                .add_enabled(!running, egui::Button::new("Paste"))
+                .clicked()
+            {
                 self.paste_expected_from_clipboard();
             }
             if ui
@@ -521,7 +1220,10 @@ impl HasherApp {
             {
                 self.pick_hash_file();
             }
-            if ui.add_enabled(!running, egui::Button::new("Clear")).clicked() {
+            if ui
+                .add_enabled(!running, egui::Button::new("Clear"))
+                .clicked()
+            {
                 self.expected_input.clear();
                 self.outcome = None;
                 self.info_message = None;
@@ -617,7 +1319,11 @@ impl HasherApp {
         let read_mib = bytes_to_mib(read);
         let total_mib = bytes_to_mib(total);
         let elapsed_secs = job.started_at.elapsed().as_secs_f64().max(1e-6);
-        let live_mbps = if read > 0 { read_mib / elapsed_secs } else { 0.0 };
+        let live_mbps = if read > 0 {
+            read_mib / elapsed_secs
+        } else {
+            0.0
+        };
 
         ui.horizontal(|ui| {
             let bar_width = (ui.available_width() - 98.0).max(120.0);
@@ -649,7 +1355,10 @@ impl HasherApp {
     }
 
     fn render_outcome(&mut self, ui: &mut egui::Ui) {
-        let copy_label = if self.copied_until.is_some_and(|until| Instant::now() < until) {
+        let copy_label = if self
+            .copied_until
+            .is_some_and(|until| Instant::now() < until)
+        {
             "Copied!"
         } else {
             "Copy Hash"
@@ -702,6 +1411,352 @@ impl HasherApp {
             self.copy_to_clipboard(&hash);
         }
     }
+
+    fn render_single_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, running: bool) {
+        ScrollArea::vertical().show(ui, |ui| {
+            Frame::new().inner_margin(Margin::same(6)).show(ui, |ui| {
+                let file_enter = self.render_file_section(ui, running);
+                ui.add_space(8.0);
+                let hash_enter = self.render_expected_section(ui, running);
+                ui.add_space(10.0);
+                self.render_action_bar(ui, ctx, running);
+
+                if !running && (file_enter || hash_enter) {
+                    self.start_verification(ctx);
+                }
+
+                if self.running.is_some() {
+                    ui.add_space(10.0);
+                    self.render_progress(ui);
+                }
+
+                if let Some(ref info) = self.info_message {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(info)
+                            .size(12.0)
+                            .color(ui.visuals().weak_text_color()),
+                    );
+                }
+
+                if self.outcome.is_some() {
+                    ui.add_space(10.0);
+                    self.render_outcome(ui);
+                }
+            });
+        });
+    }
+
+    fn render_batch_toolbar(&mut self, ui: &mut egui::Ui, batch_running: bool) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Folder").strong());
+            let edit_width = (ui.available_width() - 325.0).max(160.0);
+            let resp = ui.add_enabled(
+                !batch_running,
+                TextEdit::singleline(&mut self.batch.folder_input)
+                    .hint_text("Enter or drop containing folder path...")
+                    .desired_width(edit_width),
+            );
+            if resp.changed() {
+                if let Some(unquoted) = unquote_pasted_path(&self.batch.folder_input) {
+                    self.batch.folder_input = unquoted;
+                }
+            }
+            let enter_import = resp.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
+
+            let import_clicked = ui
+                .add_enabled(
+                    !batch_running && !self.batch.folder_input.trim().is_empty(),
+                    egui::Button::new("Import Folder"),
+                )
+                .clicked();
+            if !batch_running && (enter_import || import_clicked) {
+                let cleaned = strip_surrounding_quotes(&self.batch.folder_input);
+                if !cleaned.is_empty() {
+                    let dir = PathBuf::from(cleaned);
+                    self.import_batch_folder(&dir);
+                }
+            }
+
+            if ui
+                .add_enabled(!batch_running, egui::Button::new("Browse Folder..."))
+                .clicked()
+            {
+                self.pick_batch_folder();
+            }
+
+            ui.add_enabled_ui(!batch_running, |ui| {
+                ui.checkbox(&mut self.batch.include_subfolders, "Include subfolders");
+            });
+        });
+
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!batch_running, egui::Button::new("Select Files..."))
+                .clicked()
+            {
+                self.pick_batch_files();
+            }
+            if ui
+                .add_enabled(!batch_running, egui::Button::new("Load .txt..."))
+                .clicked()
+            {
+                self.pick_batch_hash_file();
+            }
+            if ui
+                .add_enabled(!batch_running, egui::Button::new("Paste List"))
+                .clicked()
+            {
+                self.paste_batch_hash_list();
+            }
+            if ui
+                .add_enabled(
+                    !batch_running && !self.batch.rows.is_empty(),
+                    egui::Button::new("Clear All"),
+                )
+                .clicked()
+            {
+                self.batch.rows.clear();
+                self.batch.pending_confirm = None;
+                self.batch.error_message = None;
+                self.batch.info_message = Some("Cleared batch file list.".to_owned());
+            }
+
+            ui.label(
+                RichText::new("Tip: Drag files, folders, or hash .txt manifests here.")
+                    .size(11.5)
+                    .color(ui.visuals().weak_text_color()),
+            );
+        });
+    }
+
+    fn render_batch_confirm(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let Some(confirm) = self.batch.pending_confirm.take() else {
+            return;
+        };
+        let mut next_confirm: Option<PendingBatchConfirm> = Some(confirm);
+
+        Frame::new()
+            .fill(Color32::from_rgb(120, 53, 15))
+            .stroke(Stroke::new(1.5_f32, Color32::from_rgb(245, 158, 11)))
+            .corner_radius(CornerRadius::same(6))
+            .inner_margin(Margin::same(10))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                match next_confirm {
+                    Some(PendingBatchConfirm::MissingHashes {
+                        missing_count,
+                        filled_count,
+                    }) => {
+                        ui.label(
+                            RichText::new(format!(
+                                "{missing_count} file(s) are missing hashes and will be skipped ({filled_count} file(s) ready). Continue anyway?"
+                            ))
+                            .strong()
+                            .color(Color32::WHITE),
+                        );
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Skip Empty & Check").clicked() {
+                                next_confirm = None;
+                                self.proceed_check_all_after_missing_check(ctx);
+                            }
+                            if ui.button("Cancel").clicked() {
+                                next_confirm = None;
+                            }
+                        });
+                    }
+                    Some(PendingBatchConfirm::LargeParallelBatch {
+                        file_count,
+                        total_bytes,
+                    }) => {
+                        let size_text = format_bytes(total_bytes);
+                        let cap = bounded_parallel_workers(total_bytes);
+                        ui.label(
+                            RichText::new(format!(
+                                "{file_count} files totaling {size_text} (> 2.00 GiB) queued. Parallel hashing can saturate disk I/O and slow throughput."
+                            ))
+                            .strong()
+                            .color(Color32::WHITE),
+                        );
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Run Sequentially (Recommended for >2 GiB)").clicked() {
+                                next_confirm = None;
+                                self.execute_check_all(1, ctx);
+                            }
+                            if ui
+                                .button(format!("Run Bounded Parallel (Max {cap})"))
+                                .clicked()
+                            {
+                                next_confirm = None;
+                                self.execute_check_all(cap, ctx);
+                            }
+                            if ui.button("Cancel").clicked() {
+                                next_confirm = None;
+                            }
+                        });
+                    }
+                    None => {}
+                }
+            });
+
+        if self.batch.pending_confirm.is_none() {
+            self.batch.pending_confirm = next_confirm;
+        }
+    }
+
+    fn render_batch_footer(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, batch_running: bool) {
+        let total = self.batch.rows.len();
+        let mut identical = 0usize;
+        let mut mismatch = 0usize;
+        let mut errors = 0usize;
+        for row in &self.batch.rows {
+            match &row.state {
+                BatchRowState::Finished(rep) if rep.identical => identical += 1,
+                BatchRowState::Finished(_) => mismatch += 1,
+                BatchRowState::Error(_) => errors += 1,
+                _ => {}
+            }
+        }
+        let pending = total.saturating_sub(identical + mismatch + errors);
+
+        Frame::new()
+            .inner_margin(Margin::symmetric(8, 6))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("Total: {total}")).strong());
+                    ui.separator();
+                    let id_color = if identical > 0 {
+                        Color32::from_rgb(22, 163, 74)
+                    } else {
+                        ui.visuals().text_color()
+                    };
+                    ui.label(RichText::new(format!("Identical: {identical}")).color(id_color));
+                    ui.separator();
+                    let mis_color = if mismatch > 0 {
+                        Color32::from_rgb(220, 38, 38)
+                    } else {
+                        ui.visuals().text_color()
+                    };
+                    ui.label(RichText::new(format!("Mismatch: {mismatch}")).color(mis_color));
+                    ui.separator();
+                    ui.label(format!("Pending: {pending}"));
+                    if errors > 0 {
+                        ui.separator();
+                        ui.label(
+                            RichText::new(format!("Errors: {errors}"))
+                                .color(Color32::from_rgb(217, 119, 6)),
+                        );
+                    }
+
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let check_btn = egui::Button::new(
+                            RichText::new("Check All")
+                                .size(14.5)
+                                .strong()
+                                .color(Color32::WHITE),
+                        )
+                        .fill(Color32::from_rgb(37, 99, 235))
+                        .corner_radius(CornerRadius::same(6))
+                        .min_size(Vec2::new(136.0, 32.0));
+
+                        if ui
+                            .add_enabled(!batch_running && !self.batch.rows.is_empty(), check_btn)
+                            .clicked()
+                        {
+                            self.request_check_all(ctx);
+                        }
+
+                        if let Some(ref run) = self.batch.running {
+                            let cancelling = run.cancel_flag.load(Ordering::Relaxed);
+                            let label = if cancelling {
+                                "Cancelling..."
+                            } else {
+                                "Cancel"
+                            };
+                            let cancel_btn =
+                                egui::Button::new(label).min_size(Vec2::new(92.0, 32.0));
+                            if ui.add_enabled(!cancelling, cancel_btn).clicked() {
+                                run.cancel_flag.store(true, Ordering::Relaxed);
+                            }
+                        }
+                    });
+                });
+            });
+    }
+
+    fn render_batch_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, batch_running: bool) {
+        Frame::new().inner_margin(Margin::same(6)).show(ui, |ui| {
+            self.render_batch_toolbar(ui, batch_running);
+
+            if let Some(ref err) = self.batch.error_message {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(err)
+                        .size(12.0)
+                        .color(Color32::from_rgb(239, 68, 68)),
+                );
+            } else if let Some(ref info) = self.batch.info_message {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(info)
+                        .size(12.0)
+                        .color(ui.visuals().weak_text_color()),
+                );
+            }
+
+            if self.batch.pending_confirm.is_some() {
+                ui.add_space(6.0);
+                self.render_batch_confirm(ui, ctx);
+            }
+
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(4.0);
+
+            if self.batch.rows.is_empty() {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(40.0);
+                    ui.label(RichText::new("No files imported yet.").size(15.0).strong());
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(
+                            "Import a folder, use Select Files..., or drag & drop files here.",
+                        )
+                        .color(ui.visuals().weak_text_color()),
+                    );
+                });
+                return;
+            }
+
+            let mut deferred_action: Option<BatchRowAction> = None;
+            ScrollArea::vertical()
+                .id_salt("batch_rows_scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for row in &mut self.batch.rows {
+                        if let Some(act) = render_batch_row(ui, row, batch_running) {
+                            deferred_action = Some(act);
+                        }
+                        ui.add_space(6.0);
+                    }
+                });
+
+            if let Some(action) = deferred_action {
+                match action {
+                    BatchRowAction::Paste(id) => self.paste_into_batch_row(id),
+                    BatchRowAction::Check(id) => self.start_single_batch_row(id, ctx),
+                    BatchRowAction::Remove(id) => {
+                        self.batch.rows.retain(|row| row.id != id);
+                        self.batch.pending_confirm = None;
+                    }
+                    BatchRowAction::Copy(text) => self.copy_to_clipboard(&text),
+                }
+            }
+        });
+    }
 }
 
 impl Drop for HasherApp {
@@ -709,12 +1764,16 @@ impl Drop for HasherApp {
         if let Some(ref job) = self.running {
             job.cancel_flag.store(true, Ordering::Relaxed);
         }
+        if let Some(ref batch) = self.batch.running {
+            batch.cancel_flag.store(true, Ordering::Relaxed);
+        }
     }
 }
 
 impl eframe::App for HasherApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_worker(ctx);
+        self.poll_batch_worker(ctx);
         self.handle_dropped_files(ctx);
 
         if let Some(until) = self.copied_until {
@@ -726,42 +1785,43 @@ impl eframe::App for HasherApp {
         }
 
         let running = self.running.is_some();
+        let batch_running = self.batch.running.is_some();
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ScrollArea::vertical().show(ui, |ui| {
-                Frame::new().inner_margin(Margin::same(6)).show(ui, |ui| {
+        TopBottomPanel::top("hasher_top_bar").show(ctx, |ui| {
+            Frame::new()
+                .inner_margin(Margin::symmetric(8, 6))
+                .show(ui, |ui| {
                     Self::render_header(ui);
-                    ui.add_space(6.0);
-                    let file_enter = self.render_file_section(ui, running);
-                    ui.add_space(8.0);
-                    let hash_enter = self.render_expected_section(ui, running);
-                    ui.add_space(10.0);
-                    self.render_action_bar(ui, ctx, running);
-
-                    if !running && (file_enter || hash_enter) {
-                        self.start_verification(ctx);
-                    }
-
-                    if self.running.is_some() {
-                        ui.add_space(10.0);
-                        self.render_progress(ui);
-                    }
-
-                    if let Some(ref info) = self.info_message {
-                        ui.add_space(6.0);
-                        ui.label(
-                            RichText::new(info)
-                                .size(12.0)
-                                .color(ui.visuals().weak_text_color()),
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(
+                            &mut self.active_tab,
+                            ActiveTab::SingleFile,
+                            "Single File",
                         );
-                    }
-
-                    if self.outcome.is_some() {
-                        ui.add_space(10.0);
-                        self.render_outcome(ui);
-                    }
+                        let batch_label = if self.batch.rows.is_empty() {
+                            "Batch Check".to_owned()
+                        } else {
+                            format!("Batch Check ({})", self.batch.rows.len())
+                        };
+                        ui.selectable_value(
+                            &mut self.active_tab,
+                            ActiveTab::BatchCheck,
+                            batch_label,
+                        );
+                    });
                 });
+        });
+
+        if self.active_tab == ActiveTab::BatchCheck {
+            TopBottomPanel::bottom("batch_footer").show(ctx, |ui| {
+                self.render_batch_footer(ui, ctx, batch_running);
             });
+        }
+
+        egui::CentralPanel::default().show(ctx, |ui| match self.active_tab {
+            ActiveTab::SingleFile => self.render_single_tab(ui, ctx, running),
+            ActiveTab::BatchCheck => self.render_batch_tab(ui, ctx, batch_running),
         });
 
         let hovering_files = ctx.input(|input| !input.raw.hovered_files.is_empty());
@@ -769,6 +1829,343 @@ impl eframe::App for HasherApp {
             render_drop_overlay(ctx);
         }
     }
+}
+
+enum BatchRowAction {
+    Paste(u64),
+    Check(u64),
+    Remove(u64),
+    Copy(String),
+}
+
+fn read_clipboard_digest_or_raw(
+    override_algo: Option<HashAlgorithm>,
+) -> Result<(String, Option<HashAlgorithm>), String> {
+    let text = Clipboard::new()
+        .and_then(|mut cb| cb.get_text())
+        .map_err(|err| format!("Clipboard read failed: {err}"))?;
+    let trimmed = text.trim();
+    if (trimmed.contains('\n') || trimmed.contains('\r'))
+        && let Ok(parsed) = parse_digest_str(trimmed, override_algo)
+    {
+        let detected = parsed.explicit_algo.then_some(parsed.algorithm);
+        return Ok((parsed.hex, detected));
+    }
+    Ok((trimmed.to_owned(), None))
+}
+
+fn run_batch_worker_loop(
+    queue: &Arc<Mutex<VecDeque<BatchTask>>>,
+    sender: &mpsc::Sender<BatchWorkerMsg>,
+    cancel: &Arc<AtomicBool>,
+    repaint_ctx: &egui::Context,
+) {
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let task = {
+            let Ok(mut guard) = queue.lock() else {
+                break;
+            };
+            guard.pop_front()
+        };
+        let Some(task) = task else {
+            break;
+        };
+
+        let bytes_read = Arc::new(AtomicU64::new(0));
+        let started_at = Instant::now();
+        let _ = sender.send(BatchWorkerMsg::Started {
+            row_id: task.row_id,
+            bytes_read: Arc::clone(&bytes_read),
+            total_bytes: task.total_bytes,
+            started_at,
+        });
+        repaint_ctx.request_repaint();
+
+        let mut on_chunk = |_read: u64, _total: u64| {
+            repaint_ctx.request_repaint();
+        };
+        let result = verify_target(
+            &task.path,
+            &task.expected,
+            Some(&bytes_read),
+            Some(cancel),
+            Some(&mut on_chunk),
+        )
+        .map_err(|err| err.to_string());
+        let _ = sender.send(BatchWorkerMsg::Finished {
+            row_id: task.row_id,
+            result,
+        });
+        repaint_ctx.request_repaint();
+    }
+}
+
+fn render_batch_row(
+    ui: &mut egui::Ui,
+    row: &mut BatchRow,
+    batch_running: bool,
+) -> Option<BatchRowAction> {
+    let mut action: Option<BatchRowAction> = None;
+    let row_locked = batch_running
+        || matches!(
+            row.state,
+            BatchRowState::Queued | BatchRowState::Running { .. }
+        );
+
+    Frame::new()
+        .fill(ui.visuals().faint_bg_color)
+        .stroke(Stroke::new(
+            1.0_f32,
+            ui.visuals().widgets.noninteractive.bg_stroke.color,
+        ))
+        .corner_radius(CornerRadius::same(6))
+        .inner_margin(Margin::same(8))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            if let Some(ctrl_act) = render_batch_row_controls(ui, row, row_locked) {
+                action = Some(ctrl_act);
+            }
+            render_batch_row_hint(ui, row);
+            ui.add_space(4.0);
+            if let Some(copy_act) = render_batch_row_progress(ui, row) {
+                action = Some(copy_act);
+            }
+        });
+
+    action
+}
+
+fn render_batch_row_controls(
+    ui: &mut egui::Ui,
+    row: &mut BatchRow,
+    row_locked: bool,
+) -> Option<BatchRowAction> {
+    let mut action: Option<BatchRowAction> = None;
+    ui.horizontal(|ui| {
+        let file_title = format!("{} ({})", row.relative_label, format_bytes(row.size_bytes));
+        let file_resp = ui.add_sized(
+            [220.0, 22.0],
+            Label::new(RichText::new(file_title).strong()).truncate(),
+        );
+        file_resp.on_hover_text(row.path.display().to_string());
+
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui
+                .add_enabled(!row_locked, egui::Button::new("X"))
+                .on_hover_text("Remove file")
+                .clicked()
+            {
+                action = Some(BatchRowAction::Remove(row.id));
+            }
+            if ui
+                .add_enabled(!row_locked, egui::Button::new("Check"))
+                .clicked()
+            {
+                action = Some(BatchRowAction::Check(row.id));
+            }
+            if ui
+                .add_enabled(!row_locked, egui::Button::new("Paste"))
+                .clicked()
+            {
+                action = Some(BatchRowAction::Paste(row.id));
+            }
+
+            let prev_algo = row.algo_choice;
+            ui.add_enabled_ui(!row_locked, |ui| {
+                ComboBox::from_id_salt(("batch_algo", row.id))
+                    .selected_text(row.algo_choice.label())
+                    .width(105.0)
+                    .show_ui(ui, |ui| {
+                        for option in AlgorithmChoice::dropdown_options() {
+                            ui.selectable_value(&mut row.algo_choice, option, option.label());
+                        }
+                    });
+            });
+            if row.algo_choice != prev_algo {
+                row.state = BatchRowState::Idle;
+            }
+
+            let hash_width = ui.available_width().max(120.0);
+            let hash_resp = ui.add_enabled(
+                !row_locked,
+                TextEdit::singleline(&mut row.expected_input)
+                    .font(FontId::new(12.5, FontFamily::Monospace))
+                    .hint_text("Paste hash for this file...")
+                    .desired_width(hash_width),
+            );
+            if hash_resp.changed() {
+                row.state = BatchRowState::Idle;
+            }
+            if !row_locked && hash_resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                action = Some(BatchRowAction::Check(row.id));
+            }
+        });
+    });
+    action
+}
+
+fn render_batch_row_hint(ui: &mut egui::Ui, row: &BatchRow) {
+    let trimmed = row.expected_input.trim();
+    if trimmed.is_empty() || !matches!(row.state, BatchRowState::Idle | BatchRowState::Cancelled) {
+        return;
+    }
+
+    match parse_digest_str(trimmed, row.algo_choice.to_override()) {
+        Ok(parsed) => {
+            let algo_name = parsed.algorithm.as_str();
+            let hex_len = parsed.hex.len();
+            ui.label(
+                RichText::new(format!("Detected: {algo_name} ({hex_len} hex chars)"))
+                    .size(11.0)
+                    .color(Color32::from_rgb(22, 163, 74)),
+            );
+        }
+        Err(err) => {
+            ui.label(
+                RichText::new(format!("Digest preview: {err}"))
+                    .size(11.0)
+                    .color(Color32::from_rgb(217, 119, 6)),
+            );
+        }
+    }
+}
+
+fn render_batch_row_progress(ui: &mut egui::Ui, row: &BatchRow) -> Option<BatchRowAction> {
+    let bar_width = ui.available_width();
+
+    match &row.state {
+        BatchRowState::Idle => {
+            ui.add(
+                ProgressBar::new(0.0)
+                    .text("Ready")
+                    .desired_width(bar_width)
+                    .desired_height(20.0),
+            );
+        }
+        BatchRowState::Queued => {
+            ui.add(
+                ProgressBar::new(0.0)
+                    .text("Queued...")
+                    .desired_width(bar_width)
+                    .desired_height(20.0),
+            );
+        }
+        BatchRowState::Running {
+            bytes_read,
+            total_bytes,
+            started_at,
+        } => {
+            let read = bytes_read.load(Ordering::Relaxed);
+            let fraction = progress_fraction(read, *total_bytes);
+            let percent = fraction * 100.0;
+            let read_mib = bytes_to_mib(read);
+            let total_mib = bytes_to_mib(*total_bytes);
+            let secs = started_at.elapsed().as_secs_f64().max(1e-6);
+            let mbps = if read > 0 { read_mib / secs } else { 0.0 };
+            ui.add(
+                ProgressBar::new(fraction)
+                    .text(format!(
+                        "{percent:.1}%   {read_mib:.1} / {total_mib:.1} MiB   |   {mbps:.1} MB/s"
+                    ))
+                    .desired_width(bar_width)
+                    .desired_height(20.0),
+            );
+        }
+        BatchRowState::Finished(report) => {
+            return render_batch_row_finished(ui, report, row.id, bar_width);
+        }
+        BatchRowState::Cancelled => {
+            ui.add(
+                ProgressBar::new(0.0)
+                    .text("Cancelled")
+                    .desired_width(bar_width)
+                    .desired_height(20.0),
+            );
+        }
+        BatchRowState::Error(msg) => {
+            ui.add(
+                ProgressBar::new(1.0)
+                    .fill(Color32::from_rgb(180, 83, 9))
+                    .text(
+                        RichText::new(format!("Error: {msg}"))
+                            .color(Color32::WHITE)
+                            .strong(),
+                    )
+                    .desired_width(bar_width)
+                    .desired_height(22.0),
+            );
+        }
+    }
+
+    None
+}
+
+fn render_batch_row_finished(
+    ui: &mut egui::Ui,
+    report: &VerifyReport,
+    row_id: u64,
+    bar_width: f32,
+) -> Option<BatchRowAction> {
+    let mut action = None;
+    if report.identical {
+        let label = format!(
+            "100%   IDENTICAL   ({}  |  {} ms  |  {:.1} MB/s)",
+            report.algorithm, report.elapsed_ms, report.throughput_mbps
+        );
+        ui.horizontal(|ui| {
+            let pb_width = (bar_width - 96.0).max(120.0);
+            ui.add(
+                ProgressBar::new(1.0)
+                    .fill(Color32::from_rgb(22, 163, 74))
+                    .text(RichText::new(label).color(Color32::WHITE).strong())
+                    .desired_width(pb_width)
+                    .desired_height(22.0),
+            );
+            if ui.button("Copy Hash").clicked() {
+                action = Some(BatchRowAction::Copy(report.actual.clone()));
+            }
+        });
+        return action;
+    }
+
+    let label = format!(
+        "100%   NOT IDENTICAL. BE CAUTIOUS.   ({}  |  {} ms)",
+        report.algorithm, report.elapsed_ms
+    );
+    ui.horizontal(|ui| {
+        let pb_width = (bar_width - 102.0).max(120.0);
+        ui.add(
+            ProgressBar::new(1.0)
+                .fill(Color32::from_rgb(220, 38, 38))
+                .text(RichText::new(label).color(Color32::WHITE).strong())
+                .desired_width(pb_width)
+                .desired_height(22.0),
+        );
+        if ui.button("Copy Actual").clicked() {
+            action = Some(BatchRowAction::Copy(report.actual.clone()));
+        }
+    });
+    CollapsingHeader::new("Mismatch details (Expected vs Actual)")
+        .id_salt(("batch_mismatch", row_id))
+        .default_open(true)
+        .show(ui, |ui| {
+            let expected = report.expected.as_deref().unwrap_or("<none>");
+            ui.label(
+                RichText::new(format!("Expected: {expected}"))
+                    .monospace()
+                    .size(11.5),
+            );
+            ui.label(
+                RichText::new(format!("Actual  : {}", report.actual))
+                    .monospace()
+                    .size(11.5)
+                    .color(Color32::from_rgb(248, 113, 113)),
+            );
+        });
+    action
 }
 
 #[derive(Clone, Copy)]
@@ -926,14 +2323,7 @@ fn render_error_card(ui: &mut egui::Ui, message: &str) {
                     .color(Color32::from_rgb(254, 243, 199)),
             );
             ui.add_space(4.0);
-            ui.add(
-                Label::new(
-                    RichText::new(message)
-                        .size(13.0)
-                        .color(Color32::WHITE),
-                )
-                .wrap(),
-            );
+            ui.add(Label::new(RichText::new(message).size(13.0).color(Color32::WHITE)).wrap());
         });
 }
 
@@ -965,7 +2355,10 @@ fn render_card_details(ui: &mut egui::Ui, report: &VerifyReport, text_color: Col
 fn banner_copy_button(label: &str) -> egui::Button<'_> {
     egui::Button::new(RichText::new(label).color(Color32::WHITE).strong())
         .fill(Color32::from_rgba_unmultiplied(0, 0, 0, 75))
-        .stroke(Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 175)))
+        .stroke(Stroke::new(
+            1.0_f32,
+            Color32::from_rgba_unmultiplied(255, 255, 255, 175),
+        ))
         .corner_radius(CornerRadius::same(5))
 }
 
@@ -986,7 +2379,7 @@ fn render_drop_overlay(ctx: &egui::Context) {
     painter.text(
         rect.center(),
         Align2::CENTER_CENTER,
-        "Drop file to verify or load checksum",
+        "Drop files, folder, or checksum .txt to verify",
         FontId::proportional(20.0),
         Color32::WHITE,
     );
@@ -1027,25 +2420,6 @@ fn is_small_regular_file(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.len() <= MAX_HASH_FILE_BYTES)
 }
 
-fn is_dedicated_checksum_extension(path: &Path) -> bool {
-    let Some(ext) = path.extension().and_then(|value| value.to_str()) else {
-        return false;
-    };
-    matches!(
-        ext.to_ascii_lowercase().as_str(),
-        "sha256" | "sha512" | "sha384" | "sha1" | "md5" | "sum" | "blake3"
-    )
-}
-
-fn is_text_or_checksum_extension(path: &Path) -> bool {
-    if is_dedicated_checksum_extension(path) {
-        return true;
-    }
-    path.extension()
-        .and_then(|value| value.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("txt"))
-}
-
 #[allow(clippy::cast_precision_loss)]
 fn bytes_to_mib(bytes: u64) -> f64 {
     bytes as f64 / BYTES_PER_MIB
@@ -1083,11 +2457,16 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AlgorithmChoice, format_bytes, is_dedicated_checksum_extension,
-        is_text_or_checksum_extension, progress_fraction, strip_surrounding_quotes,
+        ActiveTab, AlgorithmChoice, BatchRow, BatchRowState, HasherApp, PendingBatchConfirm,
+        format_bytes, progress_fraction, strip_surrounding_quotes,
     };
-    use hasher::algo::HashAlgorithm;
-    use std::path::Path;
+    use hasher::algo::{HashAlgorithm, hash_bytes};
+    use hasher::batch::{
+        PARALLEL_LARGE_BATCH_BYTES, PARALLEL_WARN_FILE_COUNT, is_dedicated_checksum_extension,
+        is_text_or_checksum_extension,
+    };
+    use std::path::{Path, PathBuf};
+    use tempfile::TempDir;
 
     #[test]
     fn quotes_stripped_cleanly() {
@@ -1146,5 +2525,109 @@ mod tests {
         assert!(!is_dedicated_checksum_extension(Path::new("notes.txt")));
         assert!(is_text_or_checksum_extension(Path::new("notes.txt")));
         assert!(!is_text_or_checksum_extension(Path::new("installer.exe")));
+    }
+
+    #[test]
+    fn batch_folder_import_dedups_and_auto_loads_single_mixed_manifest() {
+        let dir = TempDir::new().expect("tempdir");
+        let f1 = dir.path().join("prog1.exe");
+        let f2 = dir.path().join("prog2.exe");
+        let f10 = dir.path().join("prog10.exe");
+        std::fs::write(&f1, b"payload1").expect("write");
+        std::fs::write(&f2, b"payload2").expect("write");
+        std::fs::write(&f10, b"payload10").expect("write");
+
+        let h1 = hash_bytes(b"payload1", HashAlgorithm::Sha256);
+        let h2 = hash_bytes(b"payload2", HashAlgorithm::Md5);
+        let h10 = hash_bytes(b"payload10", HashAlgorithm::Blake3);
+        let manifest = dir.path().join("hashes.txt");
+        std::fs::write(
+            &manifest,
+            format!("{h1} ./prog1.exe\n{h2} ./prog2.exe\nblake3:{h10} ./prog10.exe\n"),
+        )
+        .expect("write manifest");
+
+        let mut app = HasherApp::from_args(std::iter::empty::<String>());
+        app.import_batch_folder(dir.path());
+
+        assert_eq!(app.batch.rows.len(), 3);
+        let names: Vec<&str> = app
+            .batch
+            .rows
+            .iter()
+            .map(|r| r.relative_label.as_str())
+            .collect();
+        assert_eq!(names, vec!["prog1.exe", "prog2.exe", "prog10.exe"]);
+        assert_eq!(app.batch.rows[0].expected_input, h1);
+        assert_eq!(app.batch.rows[0].algo_choice, AlgorithmChoice::Auto);
+        assert_eq!(app.batch.rows[1].expected_input, h2);
+        assert_eq!(
+            app.batch.rows[2].algo_choice,
+            AlgorithmChoice::Specific(HashAlgorithm::Blake3)
+        );
+
+        app.batch.rows[0].expected_input = "custom-edited".to_owned();
+        app.import_batch_paths(&[f1], Some(dir.path()));
+        assert_eq!(app.batch.rows.len(), 3);
+        assert_eq!(app.batch.rows[0].expected_input, "custom-edited");
+    }
+
+    #[test]
+    fn batch_preflight_warns_on_missing_hashes_and_large_parallel_batches() {
+        let mut app = HasherApp::from_args(std::iter::empty::<String>());
+        let ctx = eframe::egui::Context::default();
+        let per_file = (PARALLEL_LARGE_BATCH_BYTES / 5) + 1024;
+
+        for idx in 0..PARALLEL_WARN_FILE_COUNT {
+            let p = PathBuf::from(format!("missing_disk_payload_{idx}.bin"));
+            app.batch.rows.push(BatchRow {
+                id: u64::try_from(idx + 1).expect("id"),
+                path: p.clone(),
+                canonical_key: p,
+                relative_label: format!("file_{idx}.bin"),
+                size_bytes: per_file,
+                expected_input: if idx == 0 {
+                    String::new()
+                } else {
+                    "00000000".to_owned()
+                },
+                algo_choice: AlgorithmChoice::Auto,
+                state: BatchRowState::Idle,
+            });
+        }
+
+        app.request_check_all(&ctx);
+        assert!(matches!(
+            app.batch.pending_confirm,
+            Some(PendingBatchConfirm::MissingHashes {
+                missing_count: 1,
+                filled_count: 4
+            })
+        ));
+
+        app.batch.rows[0].expected_input = "00000000".to_owned();
+        app.batch.pending_confirm = None;
+        app.request_check_all(&ctx);
+        assert!(matches!(
+            app.batch.pending_confirm,
+            Some(PendingBatchConfirm::LargeParallelBatch { file_count: 5, .. })
+        ));
+    }
+
+    #[test]
+    fn startup_directory_or_multi_file_args_open_batch_tab() {
+        let dir = TempDir::new().expect("tempdir");
+        let a = dir.path().join("a.bin");
+        let b = dir.path().join("b.bin");
+        std::fs::write(&a, b"1").expect("write");
+        std::fs::write(&b, b"2").expect("write");
+
+        let dir_app = HasherApp::from_args([dir.path().display().to_string()]);
+        assert_eq!(dir_app.active_tab, ActiveTab::BatchCheck);
+        assert_eq!(dir_app.batch.rows.len(), 2);
+
+        let multi_app = HasherApp::from_args([a.display().to_string(), b.display().to_string()]);
+        assert_eq!(multi_app.active_tab, ActiveTab::BatchCheck);
+        assert_eq!(multi_app.batch.rows.len(), 2);
     }
 }

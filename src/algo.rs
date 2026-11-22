@@ -1,10 +1,12 @@
 //! Cryptographic and checksum hashing algorithms with 4 MiB streaming I/O.
 
 use std::fmt;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::time::Instant;
 
 use md5::Digest as Md5Digest;
@@ -13,17 +15,17 @@ use sha2::Digest as Sha2Digest;
 
 /// Reusable streaming read buffer size (4 MiB).
 const STREAM_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+/// Minimum chunk length for parallel BLAKE3 hashing on `x86_64`.
+const BLAKE3_RAYON_THRESHOLD_BYTES: usize = 128 * 1024;
+/// Double-buffered slot count for overlapped file reading and hashing.
+const PIPELINE_BUFFER_COUNT: usize = 2;
+/// Windows `FILE_FLAG_SEQUENTIAL_SCAN` hint for multi-GB sequential file reads.
+#[cfg(windows)]
+const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
 
 /// Supported checksum and cryptographic hash algorithms.
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    serde::Serialize,
-    serde::Deserialize,
-    clap::ValueEnum,
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, clap::ValueEnum,
 )]
 pub enum HashAlgorithm {
     /// IEEE 802.3 CRC-32 (32-bit, 8 hex characters).
@@ -242,7 +244,11 @@ impl HasherEngine {
             Self::Sha384(h) => Sha2Digest::update(h.as_mut(), chunk),
             Self::Sha512(h) => Sha2Digest::update(h.as_mut(), chunk),
             Self::Blake3(h) => {
-                h.update(chunk);
+                if chunk.len() >= BLAKE3_RAYON_THRESHOLD_BYTES {
+                    h.update_rayon(chunk);
+                } else {
+                    h.update(chunk);
+                }
             }
         }
     }
@@ -288,67 +294,350 @@ fn check_cancelled(cancel: Option<&AtomicBool>) -> io::Result<()> {
 
 fn open_file_checked(path: &Path, cancel: Option<&AtomicBool>) -> io::Result<(File, u64)> {
     check_cancelled(cancel)?;
-    let file = File::open(path)?;
+    let mut opts = OpenOptions::new();
+    opts.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        opts.custom_flags(FILE_FLAG_SEQUENTIAL_SCAN);
+    }
+    let file = opts.open(path)?;
     let total_size = file.metadata()?.len();
     Ok((file, total_size))
 }
 
-fn stream_reader<R: Read>(
-    reader: &mut R,
+struct StreamConfig<'p, 'c, 'f> {
     total_size: u64,
-    progress: Option<&AtomicU64>,
+    progress: Option<&'p AtomicU64>,
+    cancel: Option<&'c AtomicBool>,
+    on_chunk: Option<&'f mut dyn FnMut(u64, u64)>,
+}
+
+enum StreamSource<'a, R: Read> {
+    Reader(&'a mut R),
+    File(File),
+}
+
+fn read_chunk_interruptible<R: Read>(
+    reader: &mut R,
+    buf: &mut [u8],
     cancel: Option<&AtomicBool>,
-    mut on_chunk: Option<&mut dyn FnMut(u64, u64)>,
-    mut on_bytes: impl FnMut(&[u8]),
-) -> io::Result<StreamStats> {
-    check_cancelled(cancel)?;
-
-    let mut buffer = vec![0u8; STREAM_BUFFER_BYTES];
-    let mut bytes_processed: u64 = 0;
-    let start = Instant::now();
-
+) -> io::Result<usize> {
     loop {
         check_cancelled(cancel)?;
-
-        let n = match reader.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(read_len) => read_len,
-            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+        match reader.read(buf) {
+            Ok(n) => return Ok(n),
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
             Err(err) => return Err(err),
-        };
-
-        on_bytes(&buffer[..n]);
-        bytes_processed = bytes_processed.saturating_add(n as u64);
-
-        if let Some(counter) = progress {
-            counter.store(bytes_processed, Ordering::Relaxed);
-        }
-        if let Some(cb) = on_chunk.as_deref_mut() {
-            cb(bytes_processed, total_size);
         }
     }
+}
 
+fn report_progress(
+    bytes_processed: u64,
+    total_size: u64,
+    progress: Option<&AtomicU64>,
+    on_chunk: &mut Option<&mut dyn FnMut(u64, u64)>,
+) {
+    if let Some(counter) = progress {
+        counter.store(bytes_processed, Ordering::Relaxed);
+    }
+    if let Some(cb) = on_chunk.as_deref_mut() {
+        cb(bytes_processed, total_size);
+    }
+}
+
+fn finish_stats(
+    bytes_processed: u64,
+    start: Instant,
+    total_size: u64,
+    on_chunk: &mut Option<&mut dyn FnMut(u64, u64)>,
+) -> StreamStats {
     if bytes_processed == 0 {
-        if let Some(cb) = on_chunk {
+        if let Some(cb) = on_chunk.as_deref_mut() {
             cb(0, total_size);
         }
     }
-
     let elapsed = start.elapsed();
     let elapsed_ms = elapsed.as_millis();
     let elapsed_secs = elapsed.as_secs_f64();
     #[allow(clippy::cast_precision_loss)]
     let throughput_mbps = (bytes_processed as f64 / (1024.0 * 1024.0)) / elapsed_secs.max(1e-9);
-
-    Ok(StreamStats {
+    StreamStats {
         bytes_processed,
         elapsed_ms,
         throughput_mbps,
+    }
+}
+
+fn stream_reader_buf<R: Read, F>(
+    reader: &mut R,
+    cfg: &mut StreamConfig<'_, '_, '_>,
+    mut on_buf: F,
+) -> io::Result<StreamStats>
+where
+    F: FnMut(Vec<u8>, usize) -> io::Result<Vec<u8>>,
+{
+    check_cancelled(cfg.cancel)?;
+    let mut buffer = vec![0u8; STREAM_BUFFER_BYTES];
+    let mut bytes_processed: u64 = 0;
+    let start = Instant::now();
+
+    loop {
+        let n = read_chunk_interruptible(reader, &mut buffer, cfg.cancel)?;
+        if n == 0 {
+            break;
+        }
+        buffer = on_buf(buffer, n)?;
+        bytes_processed = bytes_processed.saturating_add(n as u64);
+        report_progress(
+            bytes_processed,
+            cfg.total_size,
+            cfg.progress,
+            &mut cfg.on_chunk,
+        );
+    }
+
+    Ok(finish_stats(
+        bytes_processed,
+        start,
+        cfg.total_size,
+        &mut cfg.on_chunk,
+    ))
+}
+
+fn run_reader_worker(
+    mut file: File,
+    data_tx: &mpsc::SyncSender<io::Result<(Vec<u8>, usize)>>,
+    recycle_rx: &mpsc::Receiver<Vec<u8>>,
+    cancel: Option<&AtomicBool>,
+) {
+    loop {
+        if let Err(err) = check_cancelled(cancel) {
+            let _ = data_tx.send(Err(err));
+            return;
+        }
+        let Ok(mut buf) = recycle_rx.recv() else {
+            return;
+        };
+        match read_chunk_interruptible(&mut file, &mut buf, cancel) {
+            Ok(0) => return,
+            Ok(n) => {
+                if data_tx.send(Ok((buf, n))).is_err() {
+                    return;
+                }
+            }
+            Err(err) => {
+                let _ = data_tx.send(Err(err));
+                return;
+            }
+        }
+    }
+}
+
+fn stream_file_pipelined<F>(
+    mut file: File,
+    cfg: &mut StreamConfig<'_, '_, '_>,
+    mut on_buf: F,
+) -> io::Result<StreamStats>
+where
+    F: FnMut(Vec<u8>, usize) -> io::Result<Vec<u8>>,
+{
+    if cfg.total_size <= STREAM_BUFFER_BYTES as u64 {
+        return stream_reader_buf(&mut file, cfg, on_buf);
+    }
+
+    check_cancelled(cfg.cancel)?;
+    let (data_tx, data_rx) =
+        mpsc::sync_channel::<io::Result<(Vec<u8>, usize)>>(PIPELINE_BUFFER_COUNT);
+    let (recycle_tx, recycle_rx) = mpsc::sync_channel::<Vec<u8>>(PIPELINE_BUFFER_COUNT);
+    for _ in 0..PIPELINE_BUFFER_COUNT {
+        let _ = recycle_tx.send(vec![0u8; STREAM_BUFFER_BYTES]);
+    }
+
+    let cancel = cfg.cancel;
+    let total_size = cfg.total_size;
+    let progress = cfg.progress;
+    let start = Instant::now();
+
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let data_tx = data_tx;
+            let recycle_rx = recycle_rx;
+            run_reader_worker(file, &data_tx, &recycle_rx, cancel);
+        });
+
+        // Move consumer channel halves into this inner block so early `?` returns drop
+        // them before `std::thread::scope` joins the reader thread.
+        let bytes_processed = {
+            let data_rx = data_rx;
+            let recycle_tx = recycle_tx;
+            let mut processed: u64 = 0;
+
+            while let Ok(item) = data_rx.recv() {
+                check_cancelled(cancel)?;
+                let (buf, n) = item?;
+                let returned_buf = on_buf(buf, n)?;
+                processed = processed.saturating_add(n as u64);
+                report_progress(processed, total_size, progress, &mut cfg.on_chunk);
+                let _ = recycle_tx.send(returned_buf);
+            }
+            check_cancelled(cancel)?;
+            processed
+        };
+
+        Ok(finish_stats(
+            bytes_processed,
+            start,
+            total_size,
+            &mut cfg.on_chunk,
+        ))
     })
+}
+
+fn drive_stream<R: Read, F>(
+    source: StreamSource<'_, R>,
+    cfg: &mut StreamConfig<'_, '_, '_>,
+    on_buf: F,
+) -> io::Result<StreamStats>
+where
+    F: FnMut(Vec<u8>, usize) -> io::Result<Vec<u8>>,
+{
+    match source {
+        StreamSource::Reader(reader) => stream_reader_buf(reader, cfg, on_buf),
+        StreamSource::File(file) => stream_file_pipelined(file, cfg, on_buf),
+    }
+}
+
+fn hash_single_source<R: Read>(
+    source: StreamSource<'_, R>,
+    algo: HashAlgorithm,
+    cfg: &mut StreamConfig<'_, '_, '_>,
+) -> io::Result<HashMetrics> {
+    let mut engine = HasherEngine::new(algo);
+    let stats = drive_stream(source, cfg, |buf, n| {
+        engine.update(&buf[..n]);
+        Ok(buf)
+    })?;
+
+    Ok(HashMetrics {
+        digest: engine.finalize(),
+        algorithm: algo,
+        bytes_processed: stats.bytes_processed,
+        elapsed_ms: stats.elapsed_ms,
+        throughput_mbps: stats.throughput_mbps,
+    })
+}
+
+fn hash_many_parallel_engines<R: Read>(
+    source: StreamSource<'_, R>,
+    engines: Vec<(HashAlgorithm, HasherEngine)>,
+    cfg: &mut StreamConfig<'_, '_, '_>,
+) -> io::Result<MultiHashMetrics> {
+    let engine_count = engines.len();
+    let (ack_tx, ack_rx) = mpsc::sync_channel::<()>(engine_count);
+    let mut worker_txs = Vec::with_capacity(engine_count);
+    let mut worker_algos = Vec::with_capacity(engine_count);
+
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(engine_count);
+        for (algo, mut engine) in engines {
+            let (tx, rx) = mpsc::sync_channel::<(Arc<Vec<u8>>, usize)>(1);
+            let ack = ack_tx.clone();
+            worker_txs.push(tx);
+            worker_algos.push(algo);
+            handles.push(scope.spawn(move || {
+                while let Ok((chunk, len)) = rx.recv() {
+                    engine.update(&chunk[..len]);
+                    drop(chunk);
+                    if ack.send(()).is_err() {
+                        break;
+                    }
+                }
+                engine.finalize()
+            }));
+        }
+        drop(ack_tx);
+
+        // Move worker senders into this inner block so early errors/cancellations close
+        // worker channels before `std::thread::scope` joins worker threads.
+        let stats = {
+            let txs = worker_txs;
+            let ack_rx = ack_rx;
+            drive_stream(source, cfg, |buf, n| {
+                let shared = Arc::new(buf);
+                for tx in &txs {
+                    tx.send((Arc::clone(&shared), n))
+                        .map_err(|_| io::Error::other("hash worker channel closed"))?;
+                }
+                for _ in 0..txs.len() {
+                    ack_rx
+                        .recv()
+                        .map_err(|_| io::Error::other("hash worker failed to acknowledge chunk"))?;
+                }
+                Ok(Arc::try_unwrap(shared).unwrap_or_else(|_| vec![0u8; STREAM_BUFFER_BYTES]))
+            })?
+        };
+
+        let mut digests = Vec::with_capacity(handles.len());
+        for (algo, handle) in worker_algos.into_iter().zip(handles) {
+            let digest = handle
+                .join()
+                .map_err(|_| io::Error::other("hash worker thread panicked"))?;
+            digests.push(DigestEntry {
+                algorithm: algo,
+                digest,
+            });
+        }
+
+        Ok(MultiHashMetrics {
+            digests,
+            bytes_processed: stats.bytes_processed,
+            elapsed_ms: stats.elapsed_ms,
+            throughput_mbps: stats.throughput_mbps,
+        })
+    })
+}
+
+fn hash_many_source<R: Read>(
+    source: StreamSource<'_, R>,
+    algos: &[HashAlgorithm],
+    cfg: &mut StreamConfig<'_, '_, '_>,
+) -> io::Result<MultiHashMetrics> {
+    let mut engines: Vec<(HashAlgorithm, HasherEngine)> = algos
+        .iter()
+        .copied()
+        .map(|algo| (algo, HasherEngine::new(algo)))
+        .collect();
+
+    if engines.len() <= 1 || cfg.total_size <= STREAM_BUFFER_BYTES as u64 {
+        let stats = drive_stream(source, cfg, |buf, n| {
+            for (_, engine) in &mut engines {
+                engine.update(&buf[..n]);
+            }
+            Ok(buf)
+        })?;
+        let digests = engines
+            .into_iter()
+            .map(|(algorithm, engine)| DigestEntry {
+                algorithm,
+                digest: engine.finalize(),
+            })
+            .collect();
+        return Ok(MultiHashMetrics {
+            digests,
+            bytes_processed: stats.bytes_processed,
+            elapsed_ms: stats.elapsed_ms,
+            throughput_mbps: stats.throughput_mbps,
+        });
+    }
+
+    hash_many_parallel_engines(source, engines, cfg)
 }
 
 /// Streams a reader through the selected hash algorithm using a 4 MiB buffer.
 ///
+/// Uses `blake3::Hasher::update_rayon` when chunk size reaches `128 KiB` or larger.
 /// Checks `cancel` before and during chunk reads and returns an
 /// [`io::ErrorKind::Interrupted`] error if cancelled.
 ///
@@ -363,25 +652,21 @@ pub fn hash_reader<R: Read>(
     cancel: Option<&AtomicBool>,
     on_chunk: Option<&mut dyn FnMut(u64, u64)>,
 ) -> io::Result<HashMetrics> {
-    let mut engine = HasherEngine::new(algo);
-    let stats = stream_reader(reader, total_size, progress, cancel, on_chunk, |chunk| {
-        engine.update(chunk);
-    })?;
-
-    Ok(HashMetrics {
-        digest: engine.finalize(),
-        algorithm: algo,
-        bytes_processed: stats.bytes_processed,
-        elapsed_ms: stats.elapsed_ms,
-        throughput_mbps: stats.throughput_mbps,
-    })
+    let mut cfg = StreamConfig {
+        total_size,
+        progress,
+        cancel,
+        on_chunk,
+    };
+    hash_single_source(StreamSource::Reader(reader), algo, &mut cfg)
 }
 
 /// Streams a reader once through every algorithm in `algos` using a 4 MiB buffer.
 ///
-/// Checks `cancel` before and during chunk reads and returns an
-/// [`io::ErrorKind::Interrupted`] error if cancelled. Computed digests are
-/// returned in the exact order of `algos`.
+/// When multiple algorithms run on inputs larger than `4 MiB`, updates run across scoped
+/// worker threads concurrently. Checks `cancel` before and during chunk reads and returns
+/// an [`io::ErrorKind::Interrupted`] error if cancelled. Computed digests are returned in
+/// the exact order of `algos`.
 ///
 /// # Errors
 ///
@@ -394,35 +679,17 @@ pub fn hash_reader_many<R: Read>(
     cancel: Option<&AtomicBool>,
     on_chunk: Option<&mut dyn FnMut(u64, u64)>,
 ) -> io::Result<MultiHashMetrics> {
-    let mut engines: Vec<(HashAlgorithm, HasherEngine)> = algos
-        .iter()
-        .copied()
-        .map(|algo| (algo, HasherEngine::new(algo)))
-        .collect();
-
-    let stats = stream_reader(reader, total_size, progress, cancel, on_chunk, |chunk| {
-        for (_, engine) in &mut engines {
-            engine.update(chunk);
-        }
-    })?;
-
-    let digests = engines
-        .into_iter()
-        .map(|(algorithm, engine)| DigestEntry {
-            algorithm,
-            digest: engine.finalize(),
-        })
-        .collect();
-
-    Ok(MultiHashMetrics {
-        digests,
-        bytes_processed: stats.bytes_processed,
-        elapsed_ms: stats.elapsed_ms,
-        throughput_mbps: stats.throughput_mbps,
-    })
+    let mut cfg = StreamConfig {
+        total_size,
+        progress,
+        cancel,
+        on_chunk,
+    };
+    hash_many_source(StreamSource::Reader(reader), algos, &mut cfg)
 }
 
-/// Computes the hash digest of a file on disk with optional progress and cancel handles.
+/// Computes the hash digest of a file on disk using sequential scan hints and a
+/// double-buffered reader pipeline for files larger than `4 MiB`.
 ///
 /// # Errors
 ///
@@ -435,11 +702,18 @@ pub fn hash_file_with_progress(
     cancel: Option<&AtomicBool>,
     on_chunk: Option<&mut dyn FnMut(u64, u64)>,
 ) -> io::Result<HashMetrics> {
-    let (mut file, total_size) = open_file_checked(path, cancel)?;
-    hash_reader(&mut file, algo, total_size, progress, cancel, on_chunk)
+    let (file, total_size) = open_file_checked(path, cancel)?;
+    let mut cfg = StreamConfig {
+        total_size,
+        progress,
+        cancel,
+        on_chunk,
+    };
+    hash_single_source::<File>(StreamSource::File(file), algo, &mut cfg)
 }
 
-/// Computes multiple hash digests of a file on disk in a single streaming read pass.
+/// Computes multiple hash digests of a file on disk in a single pipelined read pass,
+/// running multiple algorithm engines concurrently for files larger than `4 MiB`.
 ///
 /// # Errors
 ///
@@ -452,8 +726,14 @@ pub fn hash_file_many_with_progress(
     cancel: Option<&AtomicBool>,
     on_chunk: Option<&mut dyn FnMut(u64, u64)>,
 ) -> io::Result<MultiHashMetrics> {
-    let (mut file, total_size) = open_file_checked(path, cancel)?;
-    hash_reader_many(&mut file, algos, total_size, progress, cancel, on_chunk)
+    let (file, total_size) = open_file_checked(path, cancel)?;
+    let mut cfg = StreamConfig {
+        total_size,
+        progress,
+        cancel,
+        on_chunk,
+    };
+    hash_many_source::<File>(StreamSource::File(file), algos, &mut cfg)
 }
 
 /// Computes the lowercase hexadecimal digest of an in-memory byte slice.
@@ -500,7 +780,10 @@ mod tests {
         assert_eq!(HashAlgorithm::from_hex_len(40), Some(HashAlgorithm::Sha1));
         assert_eq!(HashAlgorithm::from_hex_len(64), Some(HashAlgorithm::Sha256));
         assert_eq!(HashAlgorithm::from_hex_len(96), Some(HashAlgorithm::Sha384));
-        assert_eq!(HashAlgorithm::from_hex_len(128), Some(HashAlgorithm::Sha512));
+        assert_eq!(
+            HashAlgorithm::from_hex_len(128),
+            Some(HashAlgorithm::Sha512)
+        );
         assert_eq!(HashAlgorithm::from_hex_len(16), None);
     }
 
@@ -536,10 +819,7 @@ mod tests {
     #[test]
     fn test_vectors_abc_and_123456789() {
         assert_eq!(hash_bytes(b"abc", HashAlgorithm::Crc32), "352441c2");
-        assert_eq!(
-            hash_bytes(b"123456789", HashAlgorithm::Crc32),
-            "cbf43926"
-        );
+        assert_eq!(hash_bytes(b"123456789", HashAlgorithm::Crc32), "cbf43926");
         assert_eq!(
             hash_bytes(b"abc", HashAlgorithm::Md5),
             "900150983cd24fb0d6963f7d28e17f72"
@@ -625,14 +905,9 @@ mod tests {
         assert!(metrics.throughput_mbps > 0.0);
 
         cancel.store(true, Ordering::Relaxed);
-        let err = hash_file_with_progress(
-            tmp.path(),
-            HashAlgorithm::Sha256,
-            None,
-            Some(&cancel),
-            None,
-        )
-        .expect_err("cancelled read should error");
+        let err =
+            hash_file_with_progress(tmp.path(), HashAlgorithm::Sha256, None, Some(&cancel), None)
+                .expect_err("cancelled read should error");
         assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
     }
 
@@ -740,7 +1015,9 @@ mod tests {
             Some(HashAlgorithm::Blake3)
         );
 
-        for invalid in ["", "   ", "---", "___", "sha", "sha2", "sha 256", "sha256é", "unknown"] {
+        for invalid in [
+            "", "   ", "---", "___", "sha", "sha2", "sha 256", "sha256é", "unknown",
+        ] {
             assert_eq!(HashAlgorithm::from_alias(invalid), None);
         }
     }
@@ -784,9 +1061,15 @@ mod tests {
         let payload = b"abc";
         let subset = [HashAlgorithm::Blake3, HashAlgorithm::Crc32];
         let mut sub_cursor = Cursor::new(payload);
-        let sub_metrics =
-            hash_reader_many(&mut sub_cursor, &subset, payload.len() as u64, None, None, None)
-                .expect("subset multi reader");
+        let sub_metrics = hash_reader_many(
+            &mut sub_cursor,
+            &subset,
+            payload.len() as u64,
+            None,
+            None,
+            None,
+        )
+        .expect("subset multi reader");
         assert_eq!(sub_metrics.bytes_processed, 3);
         assert_eq!(sub_metrics.digests.len(), 2);
         assert_eq!(sub_metrics.digests[0].algorithm, HashAlgorithm::Blake3);
@@ -801,8 +1084,8 @@ mod tests {
         );
 
         let mut none_cursor = Cursor::new(payload);
-        let none_metrics = hash_reader_many(&mut none_cursor, &[], 3, None, None, None)
-            .expect("empty algo slice");
+        let none_metrics =
+            hash_reader_many(&mut none_cursor, &[], 3, None, None, None).expect("empty algo slice");
         assert!(none_metrics.digests.is_empty());
         assert_eq!(none_metrics.bytes_processed, 3);
 
@@ -859,5 +1142,132 @@ mod tests {
         let err = hash_file_many_with_progress(tmp.path(), algos, None, Some(&cancel), None)
             .expect_err("cancelled multi-hash should error");
         assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[test]
+    fn blake3_rayon_threshold_matches_small_chunk_hash() {
+        struct ChunkedReader<'a> {
+            data: &'a [u8],
+            pos: usize,
+            chunk_len: usize,
+        }
+
+        impl io::Read for ChunkedReader<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.pos >= self.data.len() {
+                    return Ok(0);
+                }
+                let take = (self.data.len() - self.pos)
+                    .min(self.chunk_len)
+                    .min(buf.len());
+                buf[..take].copy_from_slice(&self.data[self.pos..self.pos + take]);
+                self.pos += take;
+                Ok(take)
+            }
+        }
+
+        let payload: Vec<u8> = (0..(512 * 1024))
+            .map(|i| u8::try_from(i % 251).expect("byte value"))
+            .collect();
+        let rayon_digest = hash_bytes(&payload, HashAlgorithm::Blake3);
+
+        let mut reader = ChunkedReader {
+            data: &payload,
+            pos: 0,
+            chunk_len: 16 * 1024,
+        };
+        let streamed = hash_reader(
+            &mut reader,
+            HashAlgorithm::Blake3,
+            payload.len() as u64,
+            None,
+            None,
+            None,
+        )
+        .expect("chunked blake3");
+
+        assert_eq!(rayon_digest, streamed.digest);
+    }
+
+    #[test]
+    fn pipelined_multi_chunk_file_and_parallel_reader_match_and_cancel_midstream() {
+        use std::io::Write as _;
+
+        let size: usize = 9 * 1024 * 1024;
+        let size_u64 = u64::try_from(size).expect("size fits u64");
+        let payload: Vec<u8> = (0..size)
+            .map(|i| u8::try_from((i * 7 + 3) % 256).expect("byte value"))
+            .collect();
+
+        let mut tmp = NamedTempFile::new().expect("temp file");
+        tmp.write_all(&payload).expect("write payload");
+        tmp.flush().expect("flush payload");
+
+        let algos = HashAlgorithm::picker_order();
+
+        let mut single_updates = Vec::new();
+        let mut single_cb = |done: u64, total: u64| single_updates.push((done, total));
+        let blake_metrics = hash_file_with_progress(
+            tmp.path(),
+            HashAlgorithm::Blake3,
+            None,
+            None,
+            Some(&mut single_cb),
+        )
+        .expect("pipelined single file");
+        assert_eq!(blake_metrics.bytes_processed, size_u64);
+        assert_eq!(
+            blake_metrics.digest,
+            hash_bytes(&payload, HashAlgorithm::Blake3)
+        );
+        assert!(single_updates.len() >= 2);
+        assert_eq!(single_updates.last().copied(), Some((size_u64, size_u64)));
+
+        let many_file = hash_file_many_with_progress(tmp.path(), algos, None, None, None)
+            .expect("pipelined many file");
+        assert_eq!(many_file.bytes_processed, size_u64);
+        assert_eq!(many_file.digests.len(), algos.len());
+
+        let mut cursor = Cursor::new(&payload);
+        let many_reader = hash_reader_many(&mut cursor, algos, size_u64, None, None, None)
+            .expect("parallel reader many");
+        for ((f_entry, r_entry), &algo) in many_file
+            .digests
+            .iter()
+            .zip(many_reader.digests.iter())
+            .zip(algos)
+        {
+            let expected = hash_bytes(&payload, algo);
+            assert_eq!(f_entry.digest, expected);
+            assert_eq!(r_entry.digest, expected);
+        }
+
+        let cancel_single = AtomicBool::new(false);
+        let mut trigger_cancel = |_done: u64, _total: u64| {
+            cancel_single.store(true, Ordering::Relaxed);
+        };
+        let err_single = hash_file_with_progress(
+            tmp.path(),
+            HashAlgorithm::Sha256,
+            None,
+            Some(&cancel_single),
+            Some(&mut trigger_cancel),
+        )
+        .expect_err("midstream single cancel");
+        assert_eq!(err_single.kind(), io::ErrorKind::Interrupted);
+
+        let cancel_many = AtomicBool::new(false);
+        let mut trigger_many_cancel = |_done: u64, _total: u64| {
+            cancel_many.store(true, Ordering::Relaxed);
+        };
+        let err_many = hash_file_many_with_progress(
+            tmp.path(),
+            algos,
+            None,
+            Some(&cancel_many),
+            Some(&mut trigger_many_cancel),
+        )
+        .expect_err("midstream many cancel");
+        assert_eq!(err_many.kind(), io::ErrorKind::Interrupted);
     }
 }
