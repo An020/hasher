@@ -16,9 +16,12 @@ use eframe::egui::{
 };
 use hasher::algo::HashAlgorithm;
 use hasher::batch::{
-    BatchTargetRef, bounded_parallel_workers, canonical_path_key, hash_file_dialog_extensions,
+    BatchTargetRef, SaveHashOutcome, bounded_parallel_workers, build_folder_hash_filename,
+    build_single_hash_filename, canonical_path_key, common_batch_directory,
+    format_batch_hash_manifest, format_single_hash_file_content, hash_file_dialog_extensions,
     is_dedicated_checksum_extension, is_text_or_checksum_extension, natural_cmp,
     plan_manifest_assignments, scan_folder_for_batch, should_warn_large_parallel_batch,
+    write_hash_file_with_fallback,
 };
 use hasher::digest::{
     MAX_HASH_FILE_BYTES, ParsedDigest, parse_digest_entries_from_file,
@@ -100,11 +103,48 @@ struct RunningJob {
     cancel_flag: Arc<AtomicBool>,
     started_at: Instant,
     receiver: Receiver<Result<VerifyReport, String>>,
+    save_after_finish: bool,
 }
 
 enum AppOutcome {
     Report(VerifyReport),
     Error(String),
+}
+
+#[derive(Debug, Clone)]
+struct SingleSavePayload {
+    primary_path: PathBuf,
+    fallback_txt_path: PathBuf,
+    content: String,
+    forced_fallback_reason: Option<String>,
+    primary_ext: Option<&'static str>,
+}
+
+enum PendingSingleSave {
+    MismatchConfirm(SingleSavePayload),
+    OverwriteConfirm(SingleSavePayload),
+}
+
+#[derive(Debug, Clone)]
+enum SaveNotice {
+    Saved {
+        path: PathBuf,
+    },
+    FallbackWarning {
+        path: PathBuf,
+        reason: String,
+        content: String,
+        suggested_dir: Option<PathBuf>,
+        suggested_name: String,
+        primary_ext: Option<&'static str>,
+    },
+    Failed {
+        message: String,
+        content: String,
+        suggested_dir: Option<PathBuf>,
+        suggested_name: String,
+        primary_ext: Option<&'static str>,
+    },
 }
 
 enum BatchRowState {
@@ -131,10 +171,15 @@ struct BatchRow {
     state: BatchRowState,
 }
 
+enum BatchTaskKind {
+    Verify(ParsedDigest),
+    ComputeOnly(HashAlgorithm),
+}
+
 struct BatchTask {
     row_id: u64,
     path: PathBuf,
-    expected: ParsedDigest,
+    kind: BatchTaskKind,
     total_bytes: u64,
 }
 
@@ -157,6 +202,12 @@ struct BatchRun {
     receiver: Receiver<BatchWorkerMsg>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchRunPurpose {
+    CheckAll,
+    SaveHashes,
+}
+
 enum PendingBatchConfirm {
     MissingHashes {
         missing_count: usize,
@@ -165,17 +216,50 @@ enum PendingBatchConfirm {
     LargeParallelBatch {
         file_count: usize,
         total_bytes: u64,
+        purpose: BatchRunPurpose,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct BatchExportEntry {
+    path: PathBuf,
+    algo: HashAlgorithm,
+    hex: String,
+}
+
+#[derive(Debug, Clone)]
+struct BatchSavePayload {
+    entries: Vec<BatchExportEntry>,
+    base_dir: Option<PathBuf>,
+    uniform_algo: Option<HashAlgorithm>,
+    forced_fallback_reason: Option<String>,
+}
+
+enum PendingBatchSave {
+    QualityWarning {
+        payload: BatchSavePayload,
+        mismatch_count: usize,
+        incomplete_count: usize,
+    },
+    OverwriteConfirm {
+        payload: BatchSavePayload,
+        primary_path: PathBuf,
+        fallback_txt_path: PathBuf,
     },
 }
 
 #[derive(Default)]
 struct BatchState {
     folder_input: String,
+    last_imported_folder: Option<PathBuf>,
     include_subfolders: bool,
     rows: Vec<BatchRow>,
     next_row_id: u64,
     running: Option<BatchRun>,
+    export_after_finish: bool,
     pending_confirm: Option<PendingBatchConfirm>,
+    pending_save: Option<PendingBatchSave>,
+    save_notice: Option<SaveNotice>,
     info_message: Option<String>,
     error_message: Option<String>,
 }
@@ -187,6 +271,8 @@ struct HasherApp {
     algo_choice: AlgorithmChoice,
     running: Option<RunningJob>,
     outcome: Option<AppOutcome>,
+    pending_single_save: Option<PendingSingleSave>,
+    single_save_notice: Option<SaveNotice>,
     info_message: Option<String>,
     copied_until: Option<Instant>,
     cached_target_size: (String, Option<u64>),
@@ -218,6 +304,8 @@ impl HasherApp {
             algo_choice: AlgorithmChoice::Auto,
             running: None,
             outcome: None,
+            pending_single_save: None,
+            single_save_notice: None,
             info_message: None,
             copied_until: None,
             cached_target_size: (String::new(), None),
@@ -285,6 +373,13 @@ impl HasherApp {
         self.file_path = path.to_string_lossy().into_owned();
         self.outcome = None;
         self.info_message = None;
+        self.pending_single_save = None;
+        if !matches!(
+            self.single_save_notice,
+            Some(SaveNotice::FallbackWarning { .. })
+        ) {
+            self.single_save_notice = None;
+        }
         self.refresh_target_size();
     }
 
@@ -300,6 +395,7 @@ impl HasherApp {
                     self.algo_choice = AlgorithmChoice::Specific(parsed.algorithm);
                 }
                 self.outcome = None;
+                self.pending_single_save = None;
                 let file_label = hash_file.file_name().map_or_else(
                     || hash_file.display().to_string(),
                     |name| name.to_string_lossy().into_owned(),
@@ -310,6 +406,7 @@ impl HasherApp {
             Err(err) => {
                 let file_display = hash_file.display();
                 self.info_message = None;
+                self.pending_single_save = None;
                 self.outcome = Some(AppOutcome::Error(format!(
                     "Could not extract hash from {file_display}: {err}"
                 )));
@@ -327,6 +424,7 @@ impl HasherApp {
                     self.algo_choice = AlgorithmChoice::Specific(algo);
                 }
                 self.outcome = None;
+                self.pending_single_save = None;
                 self.info_message = if self.expected_input.is_empty() {
                     Some("Clipboard text is empty.".to_owned())
                 } else if let Some(algo) = explicit_algo {
@@ -337,6 +435,7 @@ impl HasherApp {
             }
             Err(err) => {
                 self.info_message = None;
+                self.pending_single_save = None;
                 self.outcome = Some(AppOutcome::Error(err));
             }
         }
@@ -360,13 +459,13 @@ impl HasherApp {
         }
     }
 
-    fn start_verification(&mut self, ctx: &egui::Context) {
+    fn validate_single_target_file(&mut self) -> Option<(PathBuf, u64)> {
         let cleaned = self.clean_file_path();
         if cleaned.is_empty() {
             self.outcome = Some(AppOutcome::Error(
                 "Select or enter a target file path first.".to_owned(),
             ));
-            return;
+            return None;
         }
 
         let target_path = PathBuf::from(&cleaned);
@@ -376,28 +475,25 @@ impl HasherApp {
                 self.outcome = Some(AppOutcome::Error(
                     "Selected path is not a regular file.".to_owned(),
                 ));
-                return;
+                return None;
             }
             Err(err) => {
                 self.outcome = Some(AppOutcome::Error(format!("Cannot access file: {err}")));
-                return;
+                return None;
             }
         };
         self.cached_target_size = (cleaned, Some(total_bytes));
+        Some((target_path, total_bytes))
+    }
 
-        let trimmed_expected = self.expected_input.trim();
-        let mode = if trimmed_expected.is_empty() {
-            JobMode::ComputeOnly(self.algo_choice.compute_algorithm())
-        } else {
-            match parse_digest_str(trimmed_expected, self.algo_choice.to_override()) {
-                Ok(parsed) => JobMode::Verify(parsed),
-                Err(err) => {
-                    self.outcome = Some(AppOutcome::Error(format!("Invalid expected hash: {err}")));
-                    return;
-                }
-            }
-        };
-
+    fn launch_single_job(
+        &mut self,
+        target_path: PathBuf,
+        total_bytes: u64,
+        mode: JobMode,
+        save_after_finish: bool,
+        ctx: &egui::Context,
+    ) {
         let bytes_read = Arc::new(AtomicU64::new(0));
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let (sender, receiver) = mpsc::channel::<Result<VerifyReport, String>>();
@@ -433,13 +529,167 @@ impl HasherApp {
 
         self.outcome = None;
         self.info_message = None;
+        self.pending_single_save = None;
+        if !matches!(
+            self.single_save_notice,
+            Some(SaveNotice::FallbackWarning { .. })
+        ) {
+            self.single_save_notice = None;
+        }
         self.running = Some(RunningJob {
             bytes_read,
             total_bytes,
             cancel_flag,
             started_at: Instant::now(),
             receiver,
+            save_after_finish,
         });
+    }
+
+    fn start_verification(&mut self, ctx: &egui::Context) {
+        let Some((target_path, total_bytes)) = self.validate_single_target_file() else {
+            return;
+        };
+
+        let trimmed_expected = self.expected_input.trim();
+        let mode = if trimmed_expected.is_empty() {
+            JobMode::ComputeOnly(self.algo_choice.compute_algorithm())
+        } else {
+            match parse_digest_str(trimmed_expected, self.algo_choice.to_override()) {
+                Ok(parsed) => JobMode::Verify(parsed),
+                Err(err) => {
+                    self.outcome = Some(AppOutcome::Error(format!("Invalid expected hash: {err}")));
+                    return;
+                }
+            }
+        };
+
+        self.launch_single_job(target_path, total_bytes, mode, false, ctx);
+    }
+
+    fn resolve_single_save_algorithm(&self) -> HashAlgorithm {
+        if let Some(algo) = self.algo_choice.to_override() {
+            return algo;
+        }
+        let trimmed = self.expected_input.trim();
+        if !trimmed.is_empty()
+            && let Ok(parsed) = parse_digest_str(trimmed, None)
+        {
+            return parsed.algorithm;
+        }
+        self.algo_choice.compute_algorithm()
+    }
+
+    fn request_save_single_hash(&mut self, ctx: &egui::Context) {
+        if self.running.is_some() {
+            return;
+        }
+        self.pending_single_save = None;
+        let Some((target_path, total_bytes)) = self.validate_single_target_file() else {
+            return;
+        };
+
+        let target_algo = self.resolve_single_save_algorithm();
+        let fresh_report = match &self.outcome {
+            Some(AppOutcome::Report(report))
+                if canonical_path_key(Path::new(&report.file))
+                    == canonical_path_key(&target_path)
+                    && HashAlgorithm::from_alias(&report.algorithm) == Some(target_algo) =>
+            {
+                Some(report.clone())
+            }
+            _ => None,
+        };
+
+        if let Some(report) = fresh_report {
+            self.begin_single_save_from_report(&report);
+        } else {
+            self.launch_single_job(
+                target_path,
+                total_bytes,
+                JobMode::ComputeOnly(target_algo),
+                true,
+                ctx,
+            );
+        }
+    }
+
+    fn begin_single_save_from_report(&mut self, report: &VerifyReport) {
+        let target_file = PathBuf::from(&report.file);
+        let parent = target_file
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let algo_opt = HashAlgorithm::from_alias(&report.algorithm);
+        let primary_path = parent.join(build_single_hash_filename(&target_file, algo_opt));
+        let fallback_txt_path = parent.join(build_single_hash_filename(&target_file, None));
+        let basename = target_file.file_name().map_or_else(
+            || "file".to_owned(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        let content = algo_opt.map_or_else(
+            || format!("{}  {basename}\n", report.actual.trim()),
+            |algo| format_single_hash_file_content(&target_file, algo, &report.actual),
+        );
+        let forced_fallback_reason = algo_opt.is_none().then(|| {
+            format!(
+                "Unrecognized algorithm '{}'; saved .txt fallback.",
+                report.algorithm
+            )
+        });
+        let primary_ext = algo_opt.as_ref().map(HashAlgorithm::cli_name);
+
+        let payload = SingleSavePayload {
+            primary_path,
+            fallback_txt_path,
+            content,
+            forced_fallback_reason,
+            primary_ext,
+        };
+
+        if report.expected.is_some() && !report.identical {
+            self.pending_single_save = Some(PendingSingleSave::MismatchConfirm(payload));
+        } else {
+            self.confirm_or_write_single_save(payload);
+        }
+    }
+
+    fn confirm_or_write_single_save(&mut self, payload: SingleSavePayload) {
+        let effective = if payload.forced_fallback_reason.is_some() {
+            &payload.fallback_txt_path
+        } else {
+            &payload.primary_path
+        };
+        if effective.is_file() {
+            self.pending_single_save = Some(PendingSingleSave::OverwriteConfirm(payload));
+        } else {
+            self.execute_single_save(payload);
+        }
+    }
+
+    fn execute_single_save(&mut self, payload: SingleSavePayload) {
+        let outcome = write_hash_file_with_fallback(
+            &payload.primary_path,
+            &payload.fallback_txt_path,
+            &payload.content,
+            payload.forced_fallback_reason,
+        );
+        let suggested_dir = payload
+            .primary_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf);
+        let suggested_name = payload.fallback_txt_path.file_name().map_or_else(
+            || "filehash.txt".to_owned(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        self.single_save_notice = Some(outcome_to_save_notice(
+            outcome,
+            payload.content,
+            suggested_dir,
+            suggested_name,
+            payload.primary_ext,
+        ));
     }
 
     fn poll_worker(&mut self, ctx: &egui::Context) {
@@ -449,8 +699,12 @@ impl HasherApp {
 
         match job.receiver.try_recv() {
             Ok(Ok(report)) => {
+                let save_after = job.save_after_finish;
                 self.running = None;
-                self.outcome = Some(AppOutcome::Report(report));
+                self.outcome = Some(AppOutcome::Report(report.clone()));
+                if save_after {
+                    self.begin_single_save_from_report(&report);
+                }
             }
             Ok(Err(err_msg)) => {
                 let was_cancelled = job.cancel_flag.load(Ordering::Relaxed);
@@ -617,12 +871,18 @@ impl HasherApp {
 
     fn import_batch_folder(&mut self, dir: &Path) {
         self.batch.pending_confirm = None;
+        self.batch.pending_save = None;
+        self.batch.export_after_finish = false;
         self.batch.error_message = None;
         self.batch.folder_input = dir.display().to_string();
 
         match scan_folder_for_batch(dir, self.batch.include_subfolders) {
             Ok(scan) => {
                 let (added, dups) = self.import_batch_paths(&scan.target_files, Some(dir));
+                let row_paths: Vec<&Path> =
+                    self.batch.rows.iter().map(|r| r.path.as_path()).collect();
+                self.batch.last_imported_folder =
+                    common_batch_directory(Some(dir), &row_paths).map(|_| dir.to_path_buf());
                 let mut note = format!("Added {added} file(s) from {}", dir.display());
                 if dups > 0 {
                     let _ = write!(note, " ({dups} already listed)");
@@ -658,6 +918,8 @@ impl HasherApp {
 
     fn import_batch_selection(&mut self, paths: &[PathBuf]) {
         self.batch.pending_confirm = None;
+        self.batch.pending_save = None;
+        self.batch.export_after_finish = false;
         self.batch.error_message = None;
 
         let mut dirs = Vec::new();
@@ -699,6 +961,10 @@ impl HasherApp {
             messages.push(msg);
         }
 
+        let row_paths: Vec<&Path> = self.batch.rows.iter().map(|r| r.path.as_path()).collect();
+        self.batch.last_imported_folder =
+            common_batch_directory(self.batch.last_imported_folder.as_deref(), &row_paths);
+
         for cs_path in checksum_files {
             self.load_batch_hashes_from_file(&cs_path);
             if let Some(msg) = self.batch.info_message.take() {
@@ -717,6 +983,7 @@ impl HasherApp {
         source_label: &str,
     ) -> String {
         self.batch.pending_confirm = None;
+        self.batch.pending_save = None;
         if self.batch.rows.is_empty() {
             let msg = format!(
                 "Loaded {} hash entry(s) from {source_label}, but no target files are imported yet.",
@@ -833,6 +1100,7 @@ impl HasherApp {
                 }
                 row.state = BatchRowState::Idle;
                 self.batch.pending_confirm = None;
+                self.batch.pending_save = None;
                 self.batch.error_message = None;
             }
             Err(err) => {
@@ -869,6 +1137,8 @@ impl HasherApp {
             return;
         }
         self.batch.pending_confirm = None;
+        self.batch.pending_save = None;
+        self.batch.export_after_finish = false;
         self.batch.error_message = None;
 
         let Some(row) = self.batch.rows.iter_mut().find(|r| r.id == row_id) else {
@@ -905,7 +1175,7 @@ impl HasherApp {
         let task = BatchTask {
             row_id: row.id,
             path: row.path.clone(),
-            expected: parsed,
+            kind: BatchTaskKind::Verify(parsed),
             total_bytes,
         };
         self.launch_batch_tasks(vec![task], 1, ctx);
@@ -917,6 +1187,8 @@ impl HasherApp {
         }
         self.batch.error_message = None;
         self.batch.pending_confirm = None;
+        self.batch.pending_save = None;
+        self.batch.export_after_finish = false;
 
         let filled_count = self
             .batch
@@ -959,6 +1231,7 @@ impl HasherApp {
             self.batch.pending_confirm = Some(PendingBatchConfirm::LargeParallelBatch {
                 file_count,
                 total_bytes,
+                purpose: BatchRunPurpose::CheckAll,
             });
             return;
         }
@@ -969,6 +1242,8 @@ impl HasherApp {
 
     fn execute_check_all(&mut self, max_workers: usize, ctx: &egui::Context) {
         self.batch.pending_confirm = None;
+        self.batch.pending_save = None;
+        self.batch.export_after_finish = false;
         self.batch.error_message = None;
         let mut tasks = Vec::new();
 
@@ -1008,7 +1283,7 @@ impl HasherApp {
             tasks.push(BatchTask {
                 row_id: row.id,
                 path: row.path.clone(),
-                expected: parsed,
+                kind: BatchTaskKind::Verify(parsed),
                 total_bytes,
             });
         }
@@ -1021,6 +1296,288 @@ impl HasherApp {
         }
 
         self.launch_batch_tasks(tasks, max_workers, ctx);
+    }
+
+    fn request_save_batch_hashes(&mut self, ctx: &egui::Context) {
+        if self.batch.running.is_some() || self.batch.rows.is_empty() {
+            return;
+        }
+        self.batch.error_message = None;
+        self.batch.pending_confirm = None;
+        self.batch.pending_save = None;
+
+        let (runnable_count, total_bytes) = self
+            .batch
+            .rows
+            .iter()
+            .filter(|r| !matches!(r.state, BatchRowState::Finished(_)))
+            .filter(|r| {
+                let trimmed = r.expected_input.trim();
+                trimmed.is_empty() || parse_digest_str(trimmed, r.algo_choice.to_override()).is_ok()
+            })
+            .fold((0usize, 0u64), |(cnt, sum), r| {
+                let bytes = std::fs::metadata(&r.path).map_or(r.size_bytes, |m| m.len());
+                (cnt + 1, sum.saturating_add(bytes))
+            });
+
+        if runnable_count == 0 {
+            self.begin_batch_save_from_rows();
+            return;
+        }
+
+        if should_warn_large_parallel_batch(runnable_count, total_bytes) {
+            self.batch.pending_confirm = Some(PendingBatchConfirm::LargeParallelBatch {
+                file_count: runnable_count,
+                total_bytes,
+                purpose: BatchRunPurpose::SaveHashes,
+            });
+            return;
+        }
+
+        let workers = bounded_parallel_workers(total_bytes);
+        self.execute_batch_compute_for_save(workers, ctx);
+    }
+
+    fn execute_batch_compute_for_save(&mut self, max_workers: usize, ctx: &egui::Context) {
+        self.batch.pending_confirm = None;
+        self.batch.pending_save = None;
+        self.batch.error_message = None;
+        let mut tasks = Vec::new();
+
+        for row in &mut self.batch.rows {
+            if matches!(row.state, BatchRowState::Finished(_)) {
+                continue;
+            }
+            let trimmed = row.expected_input.trim();
+            let kind = if trimmed.is_empty() {
+                BatchTaskKind::ComputeOnly(row.algo_choice.compute_algorithm())
+            } else {
+                match parse_digest_str(trimmed, row.algo_choice.to_override()) {
+                    Ok(parsed) => BatchTaskKind::Verify(parsed),
+                    Err(err) => {
+                        row.state = BatchRowState::Error(format!("Invalid expected hash: {err}"));
+                        continue;
+                    }
+                }
+            };
+
+            let total_bytes = match std::fs::metadata(&row.path) {
+                Ok(meta) if meta.is_file() => {
+                    row.size_bytes = meta.len();
+                    meta.len()
+                }
+                Ok(_) => {
+                    row.state = BatchRowState::Error("Path is not a regular file.".to_owned());
+                    continue;
+                }
+                Err(err) => {
+                    row.state = BatchRowState::Error(format!("Cannot access file: {err}"));
+                    continue;
+                }
+            };
+
+            row.state = BatchRowState::Queued;
+            tasks.push(BatchTask {
+                row_id: row.id,
+                path: row.path.clone(),
+                kind,
+                total_bytes,
+            });
+        }
+
+        if tasks.is_empty() {
+            self.batch.export_after_finish = false;
+            self.begin_batch_save_from_rows();
+            return;
+        }
+
+        self.batch.export_after_finish = true;
+        self.launch_batch_tasks(tasks, max_workers, ctx);
+    }
+
+    fn begin_batch_save_from_rows(&mut self) {
+        let mut entries = Vec::new();
+        let mut mismatch_count = 0usize;
+        let mut incomplete_count = 0usize;
+
+        for row in &self.batch.rows {
+            match &row.state {
+                BatchRowState::Finished(report) => {
+                    if let Some(algo) = HashAlgorithm::from_alias(&report.algorithm) {
+                        if report.expected.is_some() && !report.identical {
+                            mismatch_count += 1;
+                        }
+                        entries.push(BatchExportEntry {
+                            path: row.path.clone(),
+                            algo,
+                            hex: report.actual.clone(),
+                        });
+                    } else {
+                        incomplete_count += 1;
+                    }
+                }
+                _ => incomplete_count += 1,
+            }
+        }
+
+        if entries.is_empty() {
+            self.batch.error_message =
+                Some("No completed file hashes are available to save.".to_owned());
+            return;
+        }
+
+        let first_algo = entries[0].algo;
+        let all_same_algo = entries.iter().all(|entry| entry.algo == first_algo);
+        let (uniform_algo, forced_fallback_reason) = if all_same_algo {
+            (Some(first_algo), None)
+        } else {
+            (
+                None,
+                Some(
+                    "Mixed algorithms detected across exported rows; saved as .txt manifest. Please check the saved file."
+                        .to_owned(),
+                ),
+            )
+        };
+
+        let row_paths: Vec<&Path> = entries.iter().map(|e| e.path.as_path()).collect();
+        let base_dir =
+            common_batch_directory(self.batch.last_imported_folder.as_deref(), &row_paths);
+        let payload = BatchSavePayload {
+            entries,
+            base_dir,
+            uniform_algo,
+            forced_fallback_reason,
+        };
+
+        if mismatch_count > 0 || incomplete_count > 0 {
+            self.batch.pending_save = Some(PendingBatchSave::QualityWarning {
+                payload,
+                mismatch_count,
+                incomplete_count,
+            });
+        } else {
+            self.proceed_batch_save(payload);
+        }
+    }
+
+    fn proceed_batch_save(&mut self, payload: BatchSavePayload) {
+        let Some(ref dir) = payload.base_dir else {
+            let _ = self.save_batch_via_dialog(&payload);
+            return;
+        };
+
+        let primary_path = dir.join(build_folder_hash_filename(dir, payload.uniform_algo));
+        let fallback_txt_path = dir.join(build_folder_hash_filename(dir, None));
+        let effective = if payload.forced_fallback_reason.is_some() {
+            &fallback_txt_path
+        } else {
+            &primary_path
+        };
+
+        if effective.is_file() {
+            self.batch.pending_save = Some(PendingBatchSave::OverwriteConfirm {
+                payload,
+                primary_path,
+                fallback_txt_path,
+            });
+        } else {
+            let dir_copy = dir.clone();
+            self.execute_batch_save(&payload, &dir_copy, &primary_path, &fallback_txt_path);
+        }
+    }
+
+    fn execute_batch_save(
+        &mut self,
+        payload: &BatchSavePayload,
+        base_dir: &Path,
+        primary_path: &Path,
+        fallback_txt_path: &Path,
+    ) {
+        let items: Vec<(&Path, HashAlgorithm, &str)> = payload
+            .entries
+            .iter()
+            .map(|entry| (entry.path.as_path(), entry.algo, entry.hex.as_str()))
+            .collect();
+        let content = format_batch_hash_manifest(base_dir, &items);
+        let outcome = write_hash_file_with_fallback(
+            primary_path,
+            fallback_txt_path,
+            &content,
+            payload.forced_fallback_reason.clone(),
+        );
+        let suggested_name = fallback_txt_path.file_name().map_or_else(
+            || "batchhash.txt".to_owned(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        let primary_ext = payload.uniform_algo.as_ref().map(HashAlgorithm::cli_name);
+        if !matches!(outcome, SaveHashOutcome::Failed { .. }) {
+            self.batch.error_message = None;
+        }
+        self.batch.save_notice = Some(outcome_to_save_notice(
+            outcome,
+            content,
+            Some(base_dir.to_path_buf()),
+            suggested_name,
+            primary_ext,
+        ));
+    }
+
+    fn save_batch_via_dialog(&mut self, payload: &BatchSavePayload) -> bool {
+        let seed_dir = payload
+            .base_dir
+            .as_deref()
+            .unwrap_or_else(|| Path::new("batch"));
+        let suggested_name = build_folder_hash_filename(seed_dir, payload.uniform_algo);
+        let primary_ext = payload
+            .forced_fallback_reason
+            .is_none()
+            .then(|| payload.uniform_algo.as_ref().map(HashAlgorithm::cli_name))
+            .flatten();
+
+        let Some(chosen) =
+            save_dialog_pick_path(payload.base_dir.as_deref(), &suggested_name, primary_ext)
+        else {
+            return false;
+        };
+
+        let effective_dir = chosen
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        let items: Vec<(&Path, HashAlgorithm, &str)> = payload
+            .entries
+            .iter()
+            .map(|entry| (entry.path.as_path(), entry.algo, entry.hex.as_str()))
+            .collect();
+        let content = format_batch_hash_manifest(&effective_dir, &items);
+        let notice = match std::fs::write(&chosen, &content) {
+            Ok(()) => {
+                self.batch.error_message = None;
+                if let Some(ref reason) = payload.forced_fallback_reason {
+                    SaveNotice::FallbackWarning {
+                        path: chosen,
+                        reason: reason.clone(),
+                        content,
+                        suggested_dir: Some(effective_dir),
+                        suggested_name,
+                        primary_ext: None,
+                    }
+                } else {
+                    SaveNotice::Saved { path: chosen }
+                }
+            }
+            Err(err) => SaveNotice::Failed {
+                message: format!("Failed to write '{}': {err}", chosen.display()),
+                content,
+                suggested_dir: Some(effective_dir),
+                suggested_name,
+                primary_ext,
+            },
+        };
+        self.batch.save_notice = Some(notice);
+        true
     }
 
     fn launch_batch_tasks(
@@ -1104,6 +1661,8 @@ impl HasherApp {
         }
 
         if finished {
+            let should_export = self.batch.export_after_finish && !was_cancelled;
+            self.batch.export_after_finish = false;
             self.batch.running = None;
             for row in &mut self.batch.rows {
                 if matches!(
@@ -1116,6 +1675,9 @@ impl HasherApp {
                         BatchRowState::Idle
                     };
                 }
+            }
+            if should_export {
+                self.begin_batch_save_from_rows();
             }
         } else if self.batch.running.is_some() {
             ctx.request_repaint_after(Duration::from_millis(50));
@@ -1162,6 +1724,7 @@ impl HasherApp {
                 }
                 self.outcome = None;
                 self.info_message = None;
+                self.pending_single_save = None;
                 self.refresh_target_size();
             }
             if response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter)) {
@@ -1202,6 +1765,7 @@ impl HasherApp {
         if response.changed() {
             self.outcome = None;
             self.info_message = None;
+            self.pending_single_save = None;
         }
         if response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter)) {
             enter_pressed = true;
@@ -1227,6 +1791,7 @@ impl HasherApp {
                 self.expected_input.clear();
                 self.outcome = None;
                 self.info_message = None;
+                self.pending_single_save = None;
             }
 
             ui.separator();
@@ -1244,6 +1809,7 @@ impl HasherApp {
             });
             if self.algo_choice != previous_algo {
                 self.outcome = None;
+                self.pending_single_save = None;
             }
         });
 
@@ -1302,8 +1868,99 @@ impl HasherApp {
         .corner_radius(CornerRadius::same(6))
         .min_size(Vec2::new(140.0, 34.0));
 
-        if ui.add_enabled(!running, primary_button).clicked() {
-            self.start_verification(ctx);
+        let save_button = egui::Button::new(RichText::new("Save Hash").size(14.5).strong())
+            .corner_radius(CornerRadius::same(6))
+            .min_size(Vec2::new(120.0, 34.0));
+
+        let has_target = !self.clean_file_path().is_empty();
+        ui.horizontal(|ui| {
+            if ui.add_enabled(!running, primary_button).clicked() {
+                self.start_verification(ctx);
+            }
+            if ui
+                .add_enabled(!running && has_target, save_button)
+                .clicked()
+            {
+                self.request_save_single_hash(ctx);
+            }
+        });
+    }
+
+    fn render_single_save_prompt(&mut self, ui: &mut egui::Ui) {
+        let Some(prompt) = self.pending_single_save.take() else {
+            return;
+        };
+        let mut next_prompt = Some(prompt);
+
+        Frame::new()
+            .fill(Color32::from_rgb(120, 53, 15))
+            .stroke(Stroke::new(1.5_f32, Color32::from_rgb(245, 158, 11)))
+            .corner_radius(CornerRadius::same(6))
+            .inner_margin(Margin::same(10))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                match next_prompt.take() {
+                    Some(PendingSingleSave::MismatchConfirm(payload)) => {
+                        ui.label(
+                            RichText::new(
+                                "Last verification was NOT IDENTICAL. Save the file's computed (actual) hash anyway?",
+                            )
+                            .strong()
+                            .color(Color32::WHITE),
+                        );
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Save Computed Hash").clicked() {
+                                self.confirm_or_write_single_save(payload);
+                            } else if ui.button("Save As...").clicked() {
+                                if let Some(notice) = save_single_payload_via_dialog(&payload) {
+                                    self.single_save_notice = Some(notice);
+                                } else {
+                                    next_prompt = Some(PendingSingleSave::MismatchConfirm(payload));
+                                }
+                            } else if !ui.button("Cancel").clicked() {
+                                next_prompt = Some(PendingSingleSave::MismatchConfirm(payload));
+                            }
+                        });
+                    }
+                    Some(PendingSingleSave::OverwriteConfirm(payload)) => {
+                        let target_name = if payload.forced_fallback_reason.is_some() {
+                            payload.fallback_txt_path.file_name()
+                        } else {
+                            payload.primary_path.file_name()
+                        }
+                        .map_or_else(
+                            || "hash file".to_owned(),
+                            |n| n.to_string_lossy().into_owned(),
+                        );
+                        ui.label(
+                            RichText::new(format!(
+                                "'{target_name}' already exists. Overwrite or choose another location?"
+                            ))
+                            .strong()
+                            .color(Color32::WHITE),
+                        );
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Overwrite").clicked() {
+                                self.execute_single_save(payload);
+                            } else if ui.button("Save As...").clicked() {
+                                if let Some(notice) = save_single_payload_via_dialog(&payload) {
+                                    self.single_save_notice = Some(notice);
+                                } else {
+                                    next_prompt = Some(PendingSingleSave::OverwriteConfirm(payload));
+                                }
+                            } else if !ui.button("Cancel").clicked() {
+                                next_prompt = Some(PendingSingleSave::OverwriteConfirm(payload));
+                            }
+                        });
+                    }
+                    None => {}
+                }
+            });
+
+        if self.pending_single_save.is_none() {
+            self.pending_single_save = next_prompt;
         }
     }
 
@@ -1430,6 +2087,16 @@ impl HasherApp {
                     self.render_progress(ui);
                 }
 
+                if self.pending_single_save.is_some() {
+                    ui.add_space(8.0);
+                    self.render_single_save_prompt(ui);
+                }
+
+                if self.single_save_notice.is_some() {
+                    ui.add_space(8.0);
+                    render_save_notice(ui, &mut self.single_save_notice);
+                }
+
                 if let Some(ref info) = self.info_message {
                     ui.add_space(6.0);
                     ui.label(
@@ -1518,7 +2185,10 @@ impl HasherApp {
                 .clicked()
             {
                 self.batch.rows.clear();
+                self.batch.last_imported_folder = None;
+                self.batch.export_after_finish = false;
                 self.batch.pending_confirm = None;
+                self.batch.pending_save = None;
                 self.batch.error_message = None;
                 self.batch.info_message = Some("Cleared batch file list.".to_owned());
             }
@@ -1570,6 +2240,7 @@ impl HasherApp {
                     Some(PendingBatchConfirm::LargeParallelBatch {
                         file_count,
                         total_bytes,
+                        purpose,
                     }) => {
                         let size_text = format_bytes(total_bytes);
                         let cap = bounded_parallel_workers(total_bytes);
@@ -1584,14 +2255,24 @@ impl HasherApp {
                         ui.horizontal(|ui| {
                             if ui.button("Run Sequentially (Recommended for >2 GiB)").clicked() {
                                 next_confirm = None;
-                                self.execute_check_all(1, ctx);
+                                match purpose {
+                                    BatchRunPurpose::CheckAll => self.execute_check_all(1, ctx),
+                                    BatchRunPurpose::SaveHashes => {
+                                        self.execute_batch_compute_for_save(1, ctx);
+                                    }
+                                }
                             }
                             if ui
                                 .button(format!("Run Bounded Parallel (Max {cap})"))
                                 .clicked()
                             {
                                 next_confirm = None;
-                                self.execute_check_all(cap, ctx);
+                                match purpose {
+                                    BatchRunPurpose::CheckAll => self.execute_check_all(cap, ctx),
+                                    BatchRunPurpose::SaveHashes => {
+                                        self.execute_batch_compute_for_save(cap, ctx);
+                                    }
+                                }
                             }
                             if ui.button("Cancel").clicked() {
                                 next_confirm = None;
@@ -1607,51 +2288,172 @@ impl HasherApp {
         }
     }
 
-    fn render_batch_footer(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, batch_running: bool) {
+    fn render_batch_save_prompt(&mut self, ui: &mut egui::Ui) {
+        let Some(prompt) = self.batch.pending_save.take() else {
+            return;
+        };
+        let mut next_prompt: Option<PendingBatchSave> = None;
+
+        Frame::new()
+            .fill(Color32::from_rgb(120, 53, 15))
+            .stroke(Stroke::new(1.5_f32, Color32::from_rgb(245, 158, 11)))
+            .corner_radius(CornerRadius::same(6))
+            .inner_margin(Margin::same(10))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                match prompt {
+                    PendingBatchSave::QualityWarning {
+                        payload,
+                        mismatch_count,
+                        incomplete_count,
+                    } => {
+                        let msg = format!(
+                            "{mismatch_count} row(s) were NOT IDENTICAL and {incomplete_count} row(s) are incomplete/errored and omitted. Export completed computed hashes anyway?"
+                        );
+                        ui.label(RichText::new(msg).strong().color(Color32::WHITE));
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Export Anyway").clicked() {
+                                self.proceed_batch_save(payload);
+                            } else if !ui.button("Cancel").clicked() {
+                                next_prompt = Some(PendingBatchSave::QualityWarning {
+                                    payload,
+                                    mismatch_count,
+                                    incomplete_count,
+                                });
+                            }
+                        });
+                    }
+                    PendingBatchSave::OverwriteConfirm {
+                        payload,
+                        primary_path,
+                        fallback_txt_path,
+                    } => {
+                        let target_name = if payload.forced_fallback_reason.is_some() {
+                            fallback_txt_path.file_name()
+                        } else {
+                            primary_path.file_name()
+                        }
+                        .map_or_else(
+                            || "hash manifest".to_owned(),
+                            |n| n.to_string_lossy().into_owned(),
+                        );
+                        ui.label(
+                            RichText::new(format!(
+                                "'{target_name}' already exists. Overwrite or choose another location?"
+                            ))
+                            .strong()
+                            .color(Color32::WHITE),
+                        );
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Overwrite").clicked() {
+                                let base_dir = payload
+                                    .base_dir
+                                    .as_deref()
+                                    .or_else(|| primary_path.parent())
+                                    .unwrap_or_else(|| Path::new("."))
+                                    .to_path_buf();
+                                self.execute_batch_save(
+                                    &payload,
+                                    &base_dir,
+                                    &primary_path,
+                                    &fallback_txt_path,
+                                );
+                            } else if ui.button("Save As...").clicked() {
+                                if !self.save_batch_via_dialog(&payload) {
+                                    next_prompt = Some(PendingBatchSave::OverwriteConfirm {
+                                        payload,
+                                        primary_path,
+                                        fallback_txt_path,
+                                    });
+                                }
+                            } else if !ui.button("Cancel").clicked() {
+                                next_prompt = Some(PendingBatchSave::OverwriteConfirm {
+                                    payload,
+                                    primary_path,
+                                    fallback_txt_path,
+                                });
+                            }
+                        });
+                    }
+                }
+            });
+
+        if self.batch.pending_save.is_none() {
+            self.batch.pending_save = next_prompt;
+        }
+    }
+
+    fn render_batch_footer_counts(&self, ui: &mut egui::Ui) {
         let total = self.batch.rows.len();
         let mut identical = 0usize;
+        let mut computed = 0usize;
         let mut mismatch = 0usize;
         let mut errors = 0usize;
         for row in &self.batch.rows {
             match &row.state {
+                BatchRowState::Finished(rep) if rep.expected.is_none() => computed += 1,
                 BatchRowState::Finished(rep) if rep.identical => identical += 1,
                 BatchRowState::Finished(_) => mismatch += 1,
                 BatchRowState::Error(_) => errors += 1,
                 _ => {}
             }
         }
-        let pending = total.saturating_sub(identical + mismatch + errors);
+        let pending = total.saturating_sub(identical + computed + mismatch + errors);
 
+        ui.label(RichText::new(format!("Total: {total}")).strong());
+        ui.separator();
+        let id_color = if identical > 0 {
+            Color32::from_rgb(22, 163, 74)
+        } else {
+            ui.visuals().text_color()
+        };
+        ui.label(RichText::new(format!("Identical: {identical}")).color(id_color));
+        if computed > 0 {
+            ui.separator();
+            ui.label(
+                RichText::new(format!("Computed: {computed}"))
+                    .color(Color32::from_rgb(96, 165, 250)),
+            );
+        }
+        ui.separator();
+        let mis_color = if mismatch > 0 {
+            Color32::from_rgb(220, 38, 38)
+        } else {
+            ui.visuals().text_color()
+        };
+        ui.label(RichText::new(format!("Mismatch: {mismatch}")).color(mis_color));
+        ui.separator();
+        ui.label(format!("Pending: {pending}"));
+        if errors > 0 {
+            ui.separator();
+            ui.label(
+                RichText::new(format!("Errors: {errors}")).color(Color32::from_rgb(217, 119, 6)),
+            );
+        }
+    }
+
+    fn render_batch_footer(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, batch_running: bool) {
         Frame::new()
             .inner_margin(Margin::symmetric(8, 6))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("Total: {total}")).strong());
-                    ui.separator();
-                    let id_color = if identical > 0 {
-                        Color32::from_rgb(22, 163, 74)
-                    } else {
-                        ui.visuals().text_color()
-                    };
-                    ui.label(RichText::new(format!("Identical: {identical}")).color(id_color));
-                    ui.separator();
-                    let mis_color = if mismatch > 0 {
-                        Color32::from_rgb(220, 38, 38)
-                    } else {
-                        ui.visuals().text_color()
-                    };
-                    ui.label(RichText::new(format!("Mismatch: {mismatch}")).color(mis_color));
-                    ui.separator();
-                    ui.label(format!("Pending: {pending}"));
-                    if errors > 0 {
-                        ui.separator();
-                        ui.label(
-                            RichText::new(format!("Errors: {errors}"))
-                                .color(Color32::from_rgb(217, 119, 6)),
-                        );
-                    }
+                    self.render_batch_footer_counts(ui);
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let save_btn =
+                            egui::Button::new(RichText::new("Save Hashes").size(14.0).strong())
+                                .corner_radius(CornerRadius::same(6))
+                                .min_size(Vec2::new(116.0, 32.0));
+
+                        if ui
+                            .add_enabled(!batch_running && !self.batch.rows.is_empty(), save_btn)
+                            .clicked()
+                        {
+                            self.request_save_batch_hashes(ctx);
+                        }
+
                         let check_btn = egui::Button::new(
                             RichText::new("Check All")
                                 .size(14.5)
@@ -1660,7 +2462,7 @@ impl HasherApp {
                         )
                         .fill(Color32::from_rgb(37, 99, 235))
                         .corner_radius(CornerRadius::same(6))
-                        .min_size(Vec2::new(136.0, 32.0));
+                        .min_size(Vec2::new(124.0, 32.0));
 
                         if ui
                             .add_enabled(!batch_running && !self.batch.rows.is_empty(), check_btn)
@@ -1679,6 +2481,7 @@ impl HasherApp {
                             let cancel_btn =
                                 egui::Button::new(label).min_size(Vec2::new(92.0, 32.0));
                             if ui.add_enabled(!cancelling, cancel_btn).clicked() {
+                                self.batch.export_after_finish = false;
                                 run.cancel_flag.store(true, Ordering::Relaxed);
                             }
                         }
@@ -1710,6 +2513,16 @@ impl HasherApp {
             if self.batch.pending_confirm.is_some() {
                 ui.add_space(6.0);
                 self.render_batch_confirm(ui, ctx);
+            }
+
+            if self.batch.pending_save.is_some() {
+                ui.add_space(6.0);
+                self.render_batch_save_prompt(ui);
+            }
+
+            if self.batch.save_notice.is_some() {
+                ui.add_space(6.0);
+                render_save_notice(ui, &mut self.batch.save_notice);
             }
 
             ui.add_space(6.0);
@@ -1751,8 +2564,16 @@ impl HasherApp {
                     BatchRowAction::Remove(id) => {
                         self.batch.rows.retain(|row| row.id != id);
                         self.batch.pending_confirm = None;
+                        self.batch.pending_save = None;
+                        let row_paths: Vec<&Path> =
+                            self.batch.rows.iter().map(|r| r.path.as_path()).collect();
+                        self.batch.last_imported_folder = common_batch_directory(
+                            self.batch.last_imported_folder.as_deref(),
+                            &row_paths,
+                        );
                     }
                     BatchRowAction::Copy(text) => self.copy_to_clipboard(&text),
+                    BatchRowAction::InvalidateSave => self.batch.pending_save = None,
                 }
             }
         });
@@ -1836,6 +2657,249 @@ enum BatchRowAction {
     Check(u64),
     Remove(u64),
     Copy(String),
+    InvalidateSave,
+}
+
+fn outcome_to_save_notice(
+    outcome: SaveHashOutcome,
+    content: String,
+    suggested_dir: Option<PathBuf>,
+    suggested_name: String,
+    primary_ext: Option<&'static str>,
+) -> SaveNotice {
+    match outcome {
+        SaveHashOutcome::SavedPrimary(path) => SaveNotice::Saved { path },
+        SaveHashOutcome::SavedFallbackTxt { path, reason } => SaveNotice::FallbackWarning {
+            path,
+            reason,
+            content,
+            suggested_dir,
+            suggested_name,
+            primary_ext,
+        },
+        SaveHashOutcome::Failed {
+            primary_path,
+            primary_err,
+            fallback_path,
+            fallback_err,
+        } => {
+            let message = if primary_path == fallback_path {
+                format!(
+                    "Save failed for '{}': {fallback_err}.",
+                    fallback_path.display()
+                )
+            } else {
+                format!(
+                    "Save failed (primary '{}': {primary_err}; fallback '{}': {fallback_err}).",
+                    primary_path.display(),
+                    fallback_path.display()
+                )
+            };
+            SaveNotice::Failed {
+                message,
+                content,
+                suggested_dir,
+                suggested_name,
+                primary_ext,
+            }
+        }
+    }
+}
+
+fn save_dialog_pick_path(
+    suggested_dir: Option<&Path>,
+    suggested_name: &str,
+    primary_ext: Option<&'static str>,
+) -> Option<PathBuf> {
+    let mut dialog = FileDialog::new().set_file_name(suggested_name);
+    if let Some(dir) = suggested_dir.filter(|p| p.is_dir()) {
+        dialog = dialog.set_directory(dir);
+    }
+    if let Some(ext) = primary_ext {
+        dialog = dialog
+            .add_filter("Hash File", &[ext])
+            .add_filter("Text File", &["txt"]);
+    } else {
+        dialog = dialog.add_filter("Text File", &["txt"]);
+    }
+    dialog.add_filter("All Files", &["*"]).save_file()
+}
+
+fn save_content_via_dialog(
+    suggested_dir: Option<&Path>,
+    suggested_name: &str,
+    primary_ext: Option<&'static str>,
+    content: &str,
+) -> Option<SaveNotice> {
+    let chosen = save_dialog_pick_path(suggested_dir, suggested_name, primary_ext)?;
+    let chosen_dir = chosen
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .or_else(|| suggested_dir.map(Path::to_path_buf));
+    let notice = match std::fs::write(&chosen, content) {
+        Ok(()) => SaveNotice::Saved { path: chosen },
+        Err(err) => SaveNotice::Failed {
+            message: format!("Failed to write '{}': {err}", chosen.display()),
+            content: content.to_owned(),
+            suggested_dir: chosen_dir,
+            suggested_name: suggested_name.to_owned(),
+            primary_ext,
+        },
+    };
+    Some(notice)
+}
+
+fn save_single_payload_via_dialog(payload: &SingleSavePayload) -> Option<SaveNotice> {
+    let parent_opt = payload
+        .primary_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty());
+    let use_primary = payload.forced_fallback_reason.is_none();
+    let suggested_name = if use_primary {
+        payload.primary_path.file_name()
+    } else {
+        payload.fallback_txt_path.file_name()
+    }
+    .map_or_else(
+        || "filehash.txt".to_owned(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let ext = use_primary.then_some(payload.primary_ext).flatten();
+    save_content_via_dialog(parent_opt, &suggested_name, ext, &payload.content)
+}
+
+struct ActionableNoticeStyle<'a> {
+    fill: Color32,
+    border: Color32,
+    title: &'a str,
+    title_color: Color32,
+    body: &'a str,
+}
+
+fn render_actionable_save_notice(
+    ui: &mut egui::Ui,
+    style: &ActionableNoticeStyle<'_>,
+    suggested_dir: Option<&Path>,
+    suggested_name: &str,
+    primary_ext: Option<&'static str>,
+    content: &str,
+) -> (Option<SaveNotice>, bool) {
+    let mut replacement = None;
+    let mut keep = true;
+
+    Frame::new()
+        .fill(style.fill)
+        .stroke(Stroke::new(1.5_f32, style.border))
+        .corner_radius(CornerRadius::same(6))
+        .inner_margin(Margin::same(10))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(RichText::new(style.title).strong().color(style.title_color));
+            ui.add(Label::new(RichText::new(style.body).size(12.5).color(Color32::WHITE)).wrap());
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("Save As...").clicked()
+                    && let Some(next) =
+                        save_content_via_dialog(suggested_dir, suggested_name, primary_ext, content)
+                {
+                    replacement = Some(next);
+                }
+                if ui.button("Dismiss").clicked() {
+                    keep = false;
+                }
+            });
+        });
+
+    (replacement, keep)
+}
+
+fn render_save_notice(ui: &mut egui::Ui, notice: &mut Option<SaveNotice>) {
+    let Some(current) = notice.take() else {
+        return;
+    };
+    let mut keep = true;
+    let mut replacement: Option<SaveNotice> = None;
+
+    match &current {
+        SaveNotice::Saved { path } => {
+            Frame::new()
+                .fill(Color32::from_rgb(20, 83, 45))
+                .stroke(Stroke::new(1.5_f32, Color32::from_rgb(34, 197, 94)))
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(Margin::same(10))
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new(format!("Saved hash to '{}'.", path.display()))
+                                .strong()
+                                .color(Color32::WHITE),
+                        );
+                        if ui.button("Dismiss").clicked() {
+                            keep = false;
+                        }
+                    });
+                });
+        }
+        SaveNotice::FallbackWarning {
+            path,
+            reason,
+            content,
+            suggested_dir,
+            suggested_name,
+            primary_ext,
+        } => {
+            let body = format!(
+                "Saved to '{}'. {reason} Please inspect the saved file.",
+                path.display()
+            );
+            let style = ActionableNoticeStyle {
+                fill: Color32::from_rgb(120, 53, 15),
+                border: Color32::from_rgb(245, 158, 11),
+                title: "Fallback .txt Saved - Please Check File",
+                title_color: Color32::from_rgb(254, 243, 199),
+                body: &body,
+            };
+            (replacement, keep) = render_actionable_save_notice(
+                ui,
+                &style,
+                suggested_dir.as_deref(),
+                suggested_name,
+                *primary_ext,
+                content,
+            );
+        }
+        SaveNotice::Failed {
+            message,
+            content,
+            suggested_dir,
+            suggested_name,
+            primary_ext,
+        } => {
+            let style = ActionableNoticeStyle {
+                fill: Color32::from_rgb(127, 29, 29),
+                border: Color32::from_rgb(239, 68, 68),
+                title: "Save Failed",
+                title_color: Color32::from_rgb(254, 226, 226),
+                body: message,
+            };
+            (replacement, keep) = render_actionable_save_notice(
+                ui,
+                &style,
+                suggested_dir.as_deref(),
+                suggested_name,
+                *primary_ext,
+                content,
+            );
+        }
+    }
+
+    if let Some(next) = replacement {
+        *notice = Some(next);
+    } else if keep {
+        *notice = Some(current);
+    }
 }
 
 fn read_clipboard_digest_or_raw(
@@ -1887,13 +2951,22 @@ fn run_batch_worker_loop(
         let mut on_chunk = |_read: u64, _total: u64| {
             repaint_ctx.request_repaint();
         };
-        let result = verify_target(
-            &task.path,
-            &task.expected,
-            Some(&bytes_read),
-            Some(cancel),
-            Some(&mut on_chunk),
-        )
+        let result = match &task.kind {
+            BatchTaskKind::Verify(expected) => verify_target(
+                &task.path,
+                expected,
+                Some(&bytes_read),
+                Some(cancel),
+                Some(&mut on_chunk),
+            ),
+            BatchTaskKind::ComputeOnly(algo) => compute_only(
+                &task.path,
+                *algo,
+                Some(&bytes_read),
+                Some(cancel),
+                Some(&mut on_chunk),
+            ),
+        }
         .map_err(|err| err.to_string());
         let _ = sender.send(BatchWorkerMsg::Finished {
             row_id: task.row_id,
@@ -1986,6 +3059,7 @@ fn render_batch_row_controls(
             });
             if row.algo_choice != prev_algo {
                 row.state = BatchRowState::Idle;
+                action = Some(BatchRowAction::InvalidateSave);
             }
 
             let hash_width = ui.available_width().max(120.0);
@@ -1998,6 +3072,7 @@ fn render_batch_row_controls(
             );
             if hash_resp.changed() {
                 row.state = BatchRowState::Idle;
+                action = Some(BatchRowAction::InvalidateSave);
             }
             if !row_locked && hash_resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                 action = Some(BatchRowAction::Check(row.id));
@@ -2110,6 +3185,27 @@ fn render_batch_row_finished(
     bar_width: f32,
 ) -> Option<BatchRowAction> {
     let mut action = None;
+    if report.expected.is_none() {
+        let label = format!(
+            "100%   COMPUTED   ({}  |  {} ms  |  {:.1} MB/s)",
+            report.algorithm, report.elapsed_ms, report.throughput_mbps
+        );
+        ui.horizontal(|ui| {
+            let pb_width = (bar_width - 96.0).max(120.0);
+            ui.add(
+                ProgressBar::new(1.0)
+                    .fill(Color32::from_rgb(30, 58, 138))
+                    .text(RichText::new(label).color(Color32::WHITE).strong())
+                    .desired_width(pb_width)
+                    .desired_height(22.0),
+            );
+            if ui.button("Copy Hash").clicked() {
+                action = Some(BatchRowAction::Copy(report.actual.clone()));
+            }
+        });
+        return action;
+    }
+
     if report.identical {
         let label = format!(
             "100%   IDENTICAL   ({}  |  {} ms  |  {:.1} MB/s)",
@@ -2457,7 +3553,8 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActiveTab, AlgorithmChoice, BatchRow, BatchRowState, HasherApp, PendingBatchConfirm,
+        ActiveTab, AlgorithmChoice, AppOutcome, BatchRow, BatchRowState, BatchRunPurpose,
+        HasherApp, PendingBatchConfirm, PendingBatchSave, PendingSingleSave, SaveNotice,
         format_bytes, progress_fraction, strip_surrounding_quotes,
     };
     use hasher::algo::{HashAlgorithm, hash_bytes};
@@ -2465,6 +3562,7 @@ mod tests {
         PARALLEL_LARGE_BATCH_BYTES, PARALLEL_WARN_FILE_COUNT, is_dedicated_checksum_extension,
         is_text_or_checksum_extension,
     };
+    use hasher::verify::VerifyReport;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
@@ -2629,5 +3727,245 @@ mod tests {
         let multi_app = HasherApp::from_args([a.display().to_string(), b.display().to_string()]);
         assert_eq!(multi_app.active_tab, ActiveTab::BatchCheck);
         assert_eq!(multi_app.batch.rows.len(), 2);
+    }
+
+    #[test]
+    fn single_save_writes_primary_prompts_mismatch_overwrite_and_fallback() {
+        let dir = TempDir::new().expect("tempdir");
+        let sample = dir.path().join("sample.mp4");
+        std::fs::write(&sample, b"hello").expect("write");
+        let sha256 = hash_bytes(b"hello", HashAlgorithm::Sha256);
+
+        let mut app = HasherApp::from_args(std::iter::empty::<String>());
+        let ctx = eframe::egui::Context::default();
+        app.set_target_file(&sample);
+        app.outcome = Some(AppOutcome::Report(VerifyReport {
+            status: "IDENTICAL".to_owned(),
+            identical: true,
+            algorithm: HashAlgorithm::Sha256.as_str().to_owned(),
+            expected: Some(sha256.clone()),
+            actual: sha256.clone(),
+            file: sample.display().to_string(),
+            bytes: 5,
+            elapsed_ms: 1,
+            throughput_mbps: 1.0,
+        }));
+
+        app.request_save_single_hash(&ctx);
+        let expected_primary = dir.path().join("samplemp4hash.sha256");
+        assert!(matches!(
+            app.single_save_notice,
+            Some(SaveNotice::Saved { ref path }) if path == &expected_primary
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&expected_primary).expect("read"),
+            format!("{sha256}  sample.mp4\n")
+        );
+
+        app.request_save_single_hash(&ctx);
+        assert!(matches!(
+            app.pending_single_save,
+            Some(PendingSingleSave::OverwriteConfirm(_))
+        ));
+
+        app.pending_single_save = None;
+        app.outcome = Some(AppOutcome::Report(VerifyReport {
+            status: "MISMATCH".to_owned(),
+            identical: false,
+            algorithm: HashAlgorithm::Sha256.as_str().to_owned(),
+            expected: Some("0".repeat(64)),
+            actual: sha256.clone(),
+            file: sample.display().to_string(),
+            bytes: 5,
+            elapsed_ms: 1,
+            throughput_mbps: 1.0,
+        }));
+        app.request_save_single_hash(&ctx);
+        assert!(matches!(
+            app.pending_single_save,
+            Some(PendingSingleSave::MismatchConfirm(_))
+        ));
+
+        let locked = dir.path().join("locked.bin");
+        std::fs::write(&locked, b"locked").expect("write");
+        let locked_hash = hash_bytes(b"locked", HashAlgorithm::Sha256);
+        let blocker_primary = dir.path().join("lockedbinhash.sha256");
+        std::fs::create_dir(&blocker_primary).expect("create blocking dir");
+        app.set_target_file(&locked);
+        app.single_save_notice = None;
+        app.outcome = Some(AppOutcome::Report(VerifyReport {
+            status: "COMPUTED".to_owned(),
+            identical: true,
+            algorithm: HashAlgorithm::Sha256.as_str().to_owned(),
+            expected: None,
+            actual: locked_hash.clone(),
+            file: locked.display().to_string(),
+            bytes: 6,
+            elapsed_ms: 1,
+            throughput_mbps: 1.0,
+        }));
+        app.request_save_single_hash(&ctx);
+        let fallback_txt = dir.path().join("lockedbinhash.txt");
+        assert!(matches!(
+            app.single_save_notice,
+            Some(SaveNotice::FallbackWarning { ref path, .. }) if path == &fallback_txt
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&fallback_txt).expect("read"),
+            format!("{locked_hash}  locked.bin\n")
+        );
+    }
+
+    fn finished_report_state(
+        file: &Path,
+        algo: HashAlgorithm,
+        expected: Option<String>,
+        actual: String,
+        identical: bool,
+    ) -> BatchRowState {
+        let status = match expected.as_deref() {
+            None => "COMPUTED",
+            Some(_) if identical => "IDENTICAL",
+            Some(_) => "MISMATCH",
+        };
+        BatchRowState::Finished(VerifyReport {
+            status: status.to_owned(),
+            identical,
+            algorithm: algo.as_str().to_owned(),
+            expected,
+            actual,
+            file: file.display().to_string(),
+            bytes: 4,
+            elapsed_ms: 1,
+            throughput_mbps: 1.0,
+        })
+    }
+
+    #[test]
+    fn batch_save_uniform_manifest_round_trips_and_prompts_overwrite() {
+        let parent = TempDir::new().expect("tempdir");
+        let release_dir = parent.path().join("release_dir");
+        let sub = release_dir.join("sub");
+        std::fs::create_dir_all(&sub).expect("mkdir");
+
+        let f1 = release_dir.join("a.bin");
+        let f2 = sub.join("b.bin");
+        std::fs::write(&f1, b"alpha").expect("write");
+        std::fs::write(&f2, b"beta").expect("write");
+
+        let h1_sha = hash_bytes(b"alpha", HashAlgorithm::Sha256);
+        let h2_sha = hash_bytes(b"beta", HashAlgorithm::Sha256);
+
+        let mut app = HasherApp::from_args(std::iter::empty::<String>());
+        app.batch.include_subfolders = true;
+        app.import_batch_folder(&release_dir);
+        assert_eq!(
+            app.batch.last_imported_folder.as_deref(),
+            Some(release_dir.as_path())
+        );
+        assert_eq!(app.batch.rows.len(), 2);
+
+        app.batch.rows[0].state =
+            finished_report_state(&f1, HashAlgorithm::Sha256, None, h1_sha.clone(), true);
+        app.batch.rows[1].state =
+            finished_report_state(&f2, HashAlgorithm::Sha256, None, h2_sha.clone(), true);
+
+        app.begin_batch_save_from_rows();
+        let manifest_sha = release_dir.join("release_dirhash.sha256");
+        assert!(matches!(
+            app.batch.save_notice,
+            Some(SaveNotice::Saved { ref path }) if path == &manifest_sha
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&manifest_sha).expect("read"),
+            format!("{h1_sha} ./a.bin\n{h2_sha} ./sub/b.bin\n")
+        );
+
+        let mut reloaded = HasherApp::from_args(std::iter::empty::<String>());
+        reloaded.batch.include_subfolders = true;
+        reloaded.import_batch_folder(&release_dir);
+        assert_eq!(reloaded.batch.rows[0].expected_input, h1_sha);
+        assert_eq!(reloaded.batch.rows[1].expected_input, h2_sha);
+
+        app.begin_batch_save_from_rows();
+        assert!(matches!(
+            app.batch.pending_save,
+            Some(PendingBatchSave::OverwriteConfirm { .. })
+        ));
+    }
+
+    #[test]
+    fn batch_save_mixed_algos_mismatch_and_large_batch_guard() {
+        let parent = TempDir::new().expect("tempdir");
+        let release_dir = parent.path().join("release_dir");
+        std::fs::create_dir_all(&release_dir).expect("mkdir");
+        let f1 = release_dir.join("a.bin");
+        let f2 = release_dir.join("b.bin");
+        std::fs::write(&f1, b"alpha").expect("write");
+        std::fs::write(&f2, b"beta").expect("write");
+
+        let h1_sha = hash_bytes(b"alpha", HashAlgorithm::Sha256);
+        let h2_md5 = hash_bytes(b"beta", HashAlgorithm::Md5);
+
+        let mut app = HasherApp::from_args(std::iter::empty::<String>());
+        app.import_batch_folder(&release_dir);
+        app.batch.rows[0].state =
+            finished_report_state(&f1, HashAlgorithm::Sha256, None, h1_sha.clone(), true);
+        app.batch.rows[1].state =
+            finished_report_state(&f2, HashAlgorithm::Md5, None, h2_md5.clone(), true);
+
+        app.begin_batch_save_from_rows();
+        let manifest_txt = release_dir.join("release_dirhash.txt");
+        assert!(matches!(
+            app.batch.save_notice,
+            Some(SaveNotice::FallbackWarning { ref path, .. }) if path == &manifest_txt
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&manifest_txt).expect("read"),
+            format!("{h1_sha} ./a.bin\n{h2_md5} ./b.bin\n")
+        );
+
+        app.batch.rows[0].state = finished_report_state(
+            &f1,
+            HashAlgorithm::Sha256,
+            Some("0".repeat(64)),
+            h1_sha,
+            false,
+        );
+        app.begin_batch_save_from_rows();
+        assert!(matches!(
+            app.batch.pending_save,
+            Some(PendingBatchSave::QualityWarning {
+                mismatch_count: 1,
+                incomplete_count: 0,
+                ..
+            })
+        ));
+
+        let mut large_app = HasherApp::from_args(std::iter::empty::<String>());
+        let ctx = eframe::egui::Context::default();
+        let per_file = (PARALLEL_LARGE_BATCH_BYTES / 5) + 1024;
+        for idx in 0..PARALLEL_WARN_FILE_COUNT {
+            let p = PathBuf::from(format!("large_payload_{idx}.bin"));
+            large_app.batch.rows.push(BatchRow {
+                id: u64::try_from(idx + 1).expect("id"),
+                path: p.clone(),
+                canonical_key: p,
+                relative_label: format!("large_{idx}.bin"),
+                size_bytes: per_file,
+                expected_input: String::new(),
+                algo_choice: AlgorithmChoice::Auto,
+                state: BatchRowState::Idle,
+            });
+        }
+        large_app.request_save_batch_hashes(&ctx);
+        assert!(matches!(
+            large_app.batch.pending_confirm,
+            Some(PendingBatchConfirm::LargeParallelBatch {
+                file_count: 5,
+                purpose: BatchRunPurpose::SaveHashes,
+                ..
+            })
+        ));
     }
 }
