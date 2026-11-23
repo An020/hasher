@@ -253,6 +253,56 @@ where
     result
 }
 
+fn is_unc_or_device_path(raw: &str) -> bool {
+    raw.starts_with("\\\\") || raw.starts_with("//")
+}
+
+fn resolve_safe_manifest_target(base_dir: &Path, rel_path: &Path) -> Result<PathBuf, String> {
+    let raw = rel_path.to_string_lossy();
+    if raw.is_empty() || is_unc_or_device_path(&raw) {
+        return Err(format!(
+            "rejected unsafe manifest path '{}': network/device or empty path not allowed",
+            rel_path.display()
+        ));
+    }
+
+    let bytes = raw.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return Err(format!(
+            "rejected unsafe manifest path '{}': absolute drive path not allowed",
+            rel_path.display()
+        ));
+    }
+
+    for component in rel_path.components() {
+        match component {
+            std::path::Component::Prefix(_)
+            | std::path::Component::RootDir
+            | std::path::Component::ParentDir => {
+                return Err(format!(
+                    "rejected unsafe manifest path '{}': escapes manifest directory",
+                    rel_path.display()
+                ));
+            }
+            std::path::Component::CurDir | std::path::Component::Normal(_) => {}
+        }
+    }
+
+    let candidate = base_dir.join(rel_path);
+    if let (Ok(canon_base), Ok(canon_target)) = (
+        std::fs::canonicalize(base_dir),
+        std::fs::canonicalize(&candidate),
+    ) && !canon_target.starts_with(&canon_base)
+    {
+        return Err(format!(
+            "rejected unsafe manifest path '{}': resolves outside manifest directory",
+            rel_path.display()
+        ));
+    }
+
+    Ok(candidate)
+}
+
 fn run_gui(cli: &Cli) -> u8 {
     if cli.check.is_some() {
         emit_error("--gui cannot be combined with --check", cli.json);
@@ -280,11 +330,17 @@ fn run_gui(cli: &Cli) -> u8 {
     } else {
         "hasher"
     };
-    let gui_path = std::env::current_exe()
+    let Some(gui_path) = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.join(exe_name)))
         .filter(|path| path.is_file())
-        .unwrap_or_else(|| PathBuf::from(exe_name));
+    else {
+        emit_error(
+            &format!("could not find '{exe_name}' next to hashcheck executable"),
+            cli.json,
+        );
+        return 2;
+    };
 
     match std::process::Command::new(&gui_path)
         .args(&forward_args)
@@ -352,7 +408,19 @@ fn run_batch_check(manifest_arg: &Path, cli: &Cli, use_color: bool) -> u8 {
     let mut failed_entries = Vec::new();
 
     for (rel_path, expected) in &entries {
-        let target_path = base_dir.join(rel_path);
+        let target_path = match resolve_safe_manifest_target(base_dir, rel_path) {
+            Ok(path) => path,
+            Err(msg) => {
+                if !cli.json {
+                    emit_error(&msg, false);
+                }
+                failed_entries.push(BatchEntryError {
+                    file: rel_path.display().to_string(),
+                    error: msg,
+                });
+                continue;
+            }
+        };
         match verify_batch_entry(&target_path, expected, cli) {
             Ok(report) => {
                 if report.identical {
@@ -402,14 +470,16 @@ fn run_batch_check(manifest_arg: &Path, cli: &Cli, use_color: bool) -> u8 {
             println!("{json}");
         }
     } else if !cli.quiet {
-        print_batch_summary(entries.len(), matched, mismatched, failed_entries.len(), use_color);
+        print_batch_summary(
+            entries.len(),
+            matched,
+            mismatched,
+            failed_entries.len(),
+            use_color,
+        );
     }
 
-    if has_error {
-        2
-    } else {
-        u8::from(has_mismatch)
-    }
+    if has_error { 2 } else { u8::from(has_mismatch) }
 }
 
 fn print_batch_entry(report: &VerifyReport, rel_path: &Path, use_color: bool) {
@@ -477,14 +547,13 @@ fn probe_clipboard(
         return None;
     }
 
-    if !cleaned.contains('\n') && !cleaned.contains('\r') {
+    if !cleaned.contains('\n') && !cleaned.contains('\r') && !is_unc_or_device_path(cleaned) {
         let candidate_path = Path::new(cleaned);
-        if candidate_path.is_file() {
-            if let Ok(parsed) = parse_digest_from_file(candidate_path, Some(target), override_algo)
-            {
-                let preview: String = cleaned.chars().take(8).collect();
-                return Some(ClipboardCandidate { preview, parsed });
-            }
+        if candidate_path.is_file()
+            && let Ok(parsed) = parse_digest_from_file(candidate_path, Some(target), override_algo)
+        {
+            let preview: String = cleaned.chars().take(8).collect();
+            return Some(ClipboardCandidate { preview, parsed });
         }
     }
 
@@ -504,12 +573,14 @@ fn resolve_interactive_input(
 ) -> anyhow::Result<ParsedDigest> {
     let candidate_path = Path::new(input);
     if force_hash_file || (!input.contains('\n') && candidate_path.is_file()) {
-        return parse_digest_from_file(candidate_path, Some(target), override_algo).map_err(|err| {
-            anyhow::anyhow!(
-                "failed to parse hash file '{}': {err}",
-                candidate_path.display()
-            )
-        });
+        return parse_digest_from_file(candidate_path, Some(target), override_algo).map_err(
+            |err| {
+                anyhow::anyhow!(
+                    "failed to parse hash file '{}': {err}",
+                    candidate_path.display()
+                )
+            },
+        );
     }
 
     parse_digest_str(input, override_algo)
@@ -709,9 +780,9 @@ fn run_get_hash_inner(target_arg: &Path, cli: &Cli, use_color: bool) -> u8 {
             Ok(Some(sel)) => sel,
             Ok(None) => {
                 if cli.json {
-                    if let Ok(json) =
-                        serde_json::to_string_pretty(&CancelledJson { status: "CANCELLED" })
-                    {
+                    if let Ok(json) = serde_json::to_string_pretty(&CancelledJson {
+                        status: "CANCELLED",
+                    }) {
                         println!("{json}");
                     }
                 } else if !cli.quiet {
@@ -920,7 +991,10 @@ fn main() -> ExitCode {
         (Some(first), Some(second)) => run_single_verify(first, second, &cli, use_color),
         (Some(first), None) => run_compute(first, &cli, use_color),
         (None, Some(_)) => {
-            emit_error("unexpected second argument without first argument", cli.json);
+            emit_error(
+                "unexpected second argument without first argument",
+                cli.json,
+            );
             2
         }
         (None, None) => {
@@ -944,7 +1018,7 @@ mod tests {
     use clap::{CommandFactory as _, Parser as _};
     use tempfile::TempDir;
 
-    use super::{Cli, validate_target_file};
+    use super::{Cli, is_unc_or_device_path, resolve_safe_manifest_target, validate_target_file};
     use hasher::algo::HashAlgorithm;
 
     #[test]
@@ -992,5 +1066,49 @@ mod tests {
         let missing = dir.path().join("missing.bin");
         let missing_err = validate_target_file(&missing).expect_err("missing must fail");
         assert!(missing_err.contains("cannot access"));
+    }
+
+    #[test]
+    fn manifest_target_rejects_traversal_absolute_and_unc_paths() {
+        let dir = TempDir::new().expect("tempdir");
+        let sub = dir.path().join("sub");
+        std::fs::create_dir_all(&sub).expect("mkdir");
+        let safe_a = dir.path().join("a.bin");
+        let safe_b = sub.join("b.bin");
+        std::fs::write(&safe_a, b"a").expect("write");
+        std::fs::write(&safe_b, b"b").expect("write");
+
+        assert!(resolve_safe_manifest_target(dir.path(), std::path::Path::new("a.bin")).is_ok());
+        assert!(
+            resolve_safe_manifest_target(dir.path(), std::path::Path::new("./sub/b.bin")).is_ok()
+        );
+
+        for unsafe_rel in [
+            "",
+            "../secret.txt",
+            "sub/../../secret.txt",
+            "/etc/passwd",
+            r"C:\Windows\win.ini",
+            r"\\attacker\share\file.bin",
+            "//attacker/share/file.bin",
+            r"\\.\PhysicalDrive0",
+        ] {
+            assert!(
+                resolve_safe_manifest_target(dir.path(), std::path::Path::new(unsafe_rel)).is_err(),
+                "expected '{unsafe_rel}' to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn unc_and_device_paths_detected() {
+        assert!(is_unc_or_device_path(r"\\server\share\hashes.txt"));
+        assert!(is_unc_or_device_path(r"\\?\UNC\server\share\hashes.txt"));
+        assert!(is_unc_or_device_path(r"\\.\pipe\hasher"));
+        assert!(is_unc_or_device_path("//server/share/hashes.txt"));
+        assert!(!is_unc_or_device_path(
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        ));
+        assert!(!is_unc_or_device_path("./hashes.txt"));
     }
 }

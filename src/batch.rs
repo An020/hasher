@@ -858,14 +858,16 @@ mod tests {
         assert_eq!(common_batch_directory(None, &unrelated), None);
         assert_eq!(common_batch_directory(None, &[]), None);
 
+        let folder = Path::new("Dl").join("My Folder");
         assert_eq!(
-            build_folder_hash_filename(Path::new(r"C:\Dl\My Folder"), Some(HashAlgorithm::Sha256)),
+            build_folder_hash_filename(&folder, Some(HashAlgorithm::Sha256)),
             "My Folderhash.sha256"
         );
         assert_eq!(
-            build_folder_hash_filename(Path::new(r"C:\Dl\My Folder"), None),
+            build_folder_hash_filename(&folder, None),
             "My Folderhash.txt"
         );
+        #[cfg(windows)]
         assert_eq!(
             build_folder_hash_filename(Path::new(r"W:\"), Some(HashAlgorithm::Md5)),
             "batchhash.md5"

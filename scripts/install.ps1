@@ -328,12 +328,12 @@ if (-not $SkipBuild) {
     if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
         throw 'cargo was not found in PATH. Install Rust or pass -SkipBuild if release binaries are already built.'
     }
-    Write-Host 'Building release binaries (cargo build --release)...'
+    Write-Host 'Building release binaries (cargo build --release --locked)...'
     Push-Location -LiteralPath $repoRoot
     try {
-        & cargo build --release
+        & cargo build --release --locked
         if ($LASTEXITCODE -ne 0) {
-            throw "cargo build --release failed with exit code $LASTEXITCODE."
+            throw "cargo build --release --locked failed with exit code $LASTEXITCODE."
         }
     } finally {
         Pop-Location

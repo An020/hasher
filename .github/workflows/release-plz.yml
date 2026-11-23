@@ -1,0 +1,110 @@
+name: Release-plz
+
+on:
+  push:
+    branches:
+      - main
+
+permissions: {}
+
+concurrency:
+  group: release-plz-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-plz-release:
+    name: Release-plz release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    outputs:
+      releases_created: ${{ steps.release.outputs.releases_created }}
+      tag_name: ${{ steps.meta.outputs.tag }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - id: release
+        name: Run release-plz release
+        uses: release-plz/action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b # v0.5.148
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        name: Extract created tag
+        if: ${{ steps.release.outputs.releases_created == 'true' }}
+        shell: bash
+        env:
+          RELEASES_JSON: ${{ steps.release.outputs.releases }}
+        run: |
+          tag=$(printf '%s' "$RELEASES_JSON" | jq -r '.[0].tag // empty')
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  build-release:
+    name: Build Windows release archive
+    needs: release-plz-release
+    if: ${{ needs.release-plz-release.outputs.releases_created == 'true' && needs.release-plz-release.outputs.tag_name != '' }}
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.release-plz-release.outputs.tag_name }}
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - name: Run tests
+        run: cargo test --locked
+      - name: Build release binaries
+        run: cargo build --release --locked
+      - name: Package release archive and SHA-256 checksum
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ needs.release-plz-release.outputs.tag_name }}
+        run: |
+          $tag = $env:RELEASE_TAG
+          $stage = "dist\hasher-$tag-windows-x86_64"
+          $zip = "dist\hasher-$tag-windows-x86_64.zip"
+          New-Item -ItemType Directory -Path "$stage\scripts" -Force | Out-Null
+          Copy-Item target\release\hasher.exe, target\release\hashcheck.exe, README.md $stage
+          Copy-Item scripts\install.ps1, scripts\uninstall.ps1, scripts\windows-config.json "$stage\scripts"
+          Compress-Archive -Path "$stage\*" -DestinationPath $zip -Force
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  $(Split-Path $zip -Leaf)" | Set-Content "$zip.sha256" -Encoding Ascii
+      - name: Upload release assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.release-plz-release.outputs.tag_name }}
+        run: |
+          $tag = $env:RELEASE_TAG
+          $zip = "dist\hasher-$tag-windows-x86_64.zip"
+          gh release upload $tag $zip "$zip.sha256" --clobber
+
+  release-plz-pr:
+    name: Release-plz PR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - name: Run release-plz release-pr
+        uses: release-plz/action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b # v0.5.148
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

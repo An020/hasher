@@ -636,13 +636,21 @@ mod tests {
         writeln!(tmp, "{SHA256_ABC} *dir/Release.ISO").expect("write");
         tmp.flush().expect("flush");
 
-        let matched = parse_digest_from_file(
-            tmp.path(),
-            Some(Path::new("C:\\Downloads\\release.iso")),
-            None,
-        )
-        .expect("basename match");
+        let matched =
+            parse_digest_from_file(tmp.path(), Some(Path::new("downloads/Release.ISO")), None)
+                .expect("basename match");
         assert_eq!(matched.hex, SHA256_ABC);
+
+        #[cfg(windows)]
+        {
+            let win_matched = parse_digest_from_file(
+                tmp.path(),
+                Some(Path::new(r"C:\Downloads\release.iso")),
+                None,
+            )
+            .expect("windows case-insensitive basename match");
+            assert_eq!(win_matched.hex, SHA256_ABC);
+        }
 
         let ambiguous = parse_digest_from_file(tmp.path(), Some(Path::new("other.zip")), None)
             .expect_err("multiple unmatched should error");

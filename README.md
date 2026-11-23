@@ -11,8 +11,8 @@ Fast file hash verifier and digest calculator for Windows, written in Rust with 
 - **Single-pass multi-hash picker**: Compute one algorithm or all 7 in a single read pass and copy results directly to the Windows clipboard (`hashcheck -g <file>`).
 - **Desktop GUI**: Native `eframe`/`egui` window (`hasher.exe`) supporting file dialogs, drag-and-drop, clipboard digest detection, progress bar, and cancellation.
 - **Data-driven configuration**: Supported algorithm metadata lives in `HashAlgorithm` (`src/algo.rs`), and Windows installer/uninstaller behavior reads from `scripts/windows-config.json`.
-- **Fixed GUI for batch-checking files**: You can choose folder in the file selection window, this will scan for its contents, even the hidden files. Each file entry will have hash paste box + progress bar + predicted hash. 
-- **Better algorithm for batch-checking huge files (>= 2GBs)**: The algorithm is now optimized to verify hash of a big files with all kinds of hash supported and auto-detected when pasted in.
+- **Batch Check & Save (`Batch Check` tab)**: Import folders (optionally including subfolders), select files, or drag-and-drop multiple targets, auto-fill expected hashes from `.txt`/checksum manifests or clipboard lines, verify rows concurrently with a `>= 5` files `> 2 GiB` storage saturation warning, and export single-file (`Save Hash`) or folder (`Save Hashes`) manifests with automatic `.txt` fallback prompts when algorithms are mixed or primary writes fail.
+- **Multi-GB streaming pipeline**: Uses Windows `FILE_FLAG_SEQUENTIAL_SCAN`, double-buffered I/O (`stream_file_pipelined`), parallel multi-engine chunk hashing, and `blake3/rayon` acceleration across all supported algorithms.
 
 ## Install on Windows
 
@@ -88,6 +88,6 @@ Installing adds two right-click entries for files in Windows Explorer:
 
 ```powershell
 cargo test --locked
-cargo clippy --all-targets -- -D warnings
-cargo build --release
+cargo clippy --all-targets --locked -- -D warnings
+cargo build --release --locked
 ```
