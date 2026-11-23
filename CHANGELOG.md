@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.0.1] - 2026-11-23
+
+### Features
+
+* Add Tab 2 `Batch Check` GUI, multi-GB streaming pipeline, and dynamic `Save Hash` / `Save Hashes` export with `.txt` fallback prompts.
+
+### Security
+
+* Guard `hashcheck` manifest checking and clipboard probing against traversal, drive/UNC/device paths, and CWD GUI binary hijacking, and patch `url` (`RUSTSEC-2026-0592`).
+
 ## 1.0.0 (2026-11-23)
 
 
